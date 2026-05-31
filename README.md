@@ -8,8 +8,6 @@
 
 **v1.2.6** — Веб-панель управления NaiveProxy + Mieru для Ubuntu/Debian VPS
 
-[![GitHub](https://img.shields.io/badge/GitHub-cwash797--cmd-181717?logo=github)](https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX)
-
 </div>
 
 ---
