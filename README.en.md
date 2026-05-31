@@ -8,13 +8,6 @@
 
 **v1.2.6** — Web management panel for NaiveProxy + Mieru on Ubuntu/Debian VPS
 
-[![Telegram](https://img.shields.io/badge/Telegram-@russian__paradice__vpn-2CA5E0?logo=telegram&logoColor=white)](https://t.me/russian_paradice_vpn)
-[![GitHub](https://img.shields.io/badge/GitHub-cwash797--cmd-181717?logo=github)](https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX)
-[![License](https://img.shields.io/badge/License-MIT-bronze?color=c08552)](LICENSE)
-
-> 💬 **Support & updates:** [t.me/russian_paradice_vpn](https://t.me/russian_paradice_vpn)  
-> ☕ **Support the project:** [app.lava.top/2107724612](https://app.lava.top/2107724612?tabId=donate)
-
 </div>
 
 ---
@@ -332,9 +325,6 @@ ufw status
 
 ## 📝 Credits
 
-- **Author:** RIXXX
-- **Telegram:** [@russian_paradice_vpn](https://t.me/russian_paradice_vpn)
-- **Donate:** [app.lava.top/2107724612](https://app.lava.top/2107724612?tabId=donate)
 - **NaiveProxy:** [klzgrad/naiveproxy](https://github.com/klzgrad/naiveproxy)
 - **Mieru:** [enfein/mieru](https://github.com/enfein/mieru)
 - **Caddy:** [caddyserver.com](https://caddyserver.com)
