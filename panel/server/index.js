@@ -36,6 +36,8 @@ const fs             = require('fs');
 const path           = require('path');
 const { execSync, execFileSync } = require('child_process');
 const si             = require('systeminformation');
+const crypto         = require('crypto');
+const net            = require('net');
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
 const PANEL_CONFIG    = '/etc/rixxx-panel/config.json';
@@ -48,7 +50,12 @@ const CADDY_CONFIG_DIR  = '/etc/caddy-naive';
 const CADDY_FILE        = '/etc/caddy-naive/Caddyfile';
 const FAKE_SITE_DIR     = '/var/www/fake-site';
 const LOG_CADDY         = '/var/log/caddy-naive/access.log';
+const LOG_AUTH_AUDIT    = '/var/log/caddy-naive/auth-audit.log';
+const LOG_TRAFFIC_AUDIT = '/var/log/caddy-naive/traffic-audit.log';
 const LOG_PANEL         = '/var/log/panel-naive-mieru.log';
+const AUTH_AUDIT_LOG_UNCONFIGURED_REASON = 'auth audit log not configured';
+const AUTH_AUDIT_MAX_BYTES = 1024 * 1024 * 25;
+const NODE_EXPLORER_CACHE_TTL_MS = 30000;
 
 // Legacy path kept for migration detection only
 const LEGACY_NAIVE_BIN = '/usr/local/bin/naive';
@@ -79,9 +86,28 @@ try {
     cascadeEnabled: false, cascadeNaiveUpstream: '',
     cascadeMieru: { host: '', portStart: 2012, portEnd: 2022, user: '', pass: '' },
     cascadeMieruEgress: {},   // legacy (Variant A native egress) — kept for back-compat
+    nodeApiKey: '',
+    backendAllowedIps: ['127.0.0.1'],
+    allowAnyBackendIp: false,
+    sessionTtlMinutes: 10,
+    authAuditLogPath: LOG_AUTH_AUDIT,
+    trafficAuditLogPath: LOG_TRAFFIC_AUDIT,
+    ipHistoryTtlHours: 24,
+    maxUniqueIpsPerUser: 5,
+    enforceIpLimit: false,
+    subscriptionBaseUrl: '',
     language: 'ru', version: '1.2.6'
   };
 }
+
+cfg.sessionTtlMinutes = parseInt(cfg.sessionTtlMinutes, 10) || 10;
+if (cfg.authAuditLogPath === undefined) cfg.authAuditLogPath = LOG_AUTH_AUDIT;
+if (cfg.trafficAuditLogPath === undefined) cfg.trafficAuditLogPath = LOG_TRAFFIC_AUDIT;
+cfg.ipHistoryTtlHours = parseInt(cfg.ipHistoryTtlHours, 10) || 24;
+cfg.maxUniqueIpsPerUser = parseInt(cfg.maxUniqueIpsPerUser, 10) || 5;
+if (cfg.backendAllowedIps === undefined) cfg.backendAllowedIps = ['127.0.0.1'];
+else if (!Array.isArray(cfg.backendAllowedIps)) cfg.backendAllowedIps = [];
+if (cfg.allowAnyBackendIp !== true) cfg.allowAnyBackendIp = false;
 
 // Resolved paths (prefer config values, fall back to constants)
 const resolvedDb        = cfg.dbPath        || DB_PATH;
@@ -109,6 +135,9 @@ try {
       protocols TEXT DEFAULT '["naive","mieru"]',
       quotaMB   INTEGER DEFAULT 0,
       usedMB    REAL    DEFAULT 0,
+      enabled   INTEGER DEFAULT 1,
+      suspicious INTEGER DEFAULT 0,
+      subscriptionToken TEXT,
       createdAt TEXT NOT NULL,
       updatedAt TEXT NOT NULL,
       lastSeen  TEXT
@@ -124,9 +153,41 @@ try {
       key   TEXT PRIMARY KEY,
       value TEXT
     );
+    CREATE TABLE IF NOT EXISTS active_sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT,
+      username TEXT NOT NULL,
+      protocol TEXT NOT NULL,
+      remote_ip TEXT NOT NULL,
+      user_agent TEXT,
+      first_seen DATETIME NOT NULL,
+      last_seen DATETIME NOT NULL,
+      bytes_up INTEGER DEFAULT 0,
+      bytes_down INTEGER DEFAULT 0,
+      UNIQUE(username, protocol, remote_ip)
+    );
+    CREATE TABLE IF NOT EXISTS session_resets (
+      username TEXT PRIMARY KEY,
+      reset_at TEXT NOT NULL
+    );
   `);
-  // Migrate: add password column if missing (upgrade from v1.0.x)
-  try { db.exec(`ALTER TABLE users ADD COLUMN password TEXT NOT NULL DEFAULT ''`); } catch {}
+  // Migrate legacy user tables in-place. SQLite cannot add a UNIQUE column via
+  // ALTER TABLE, so subscriptionToken is added as plain TEXT and indexed later.
+  try {
+    const cols = new Set(db.prepare(`PRAGMA table_info(users)`).all().map(c => c.name));
+    const addColumn = (name, ddl) => {
+      if (!cols.has(name)) {
+        db.exec(`ALTER TABLE users ADD COLUMN ${ddl}`);
+        cols.add(name);
+      }
+    };
+    addColumn('password', `password TEXT NOT NULL DEFAULT ''`);
+    addColumn('enabled', 'enabled INTEGER DEFAULT 1');
+    addColumn('suspicious', 'suspicious INTEGER DEFAULT 0');
+    addColumn('subscriptionToken', 'subscriptionToken TEXT');
+  } catch (e) {
+    console.error('[DB] users column migration skipped:', e.message);
+  }
 
   // Migrate: make `email` nullable so it can be optional (TLS cert is set at
   // install time via Caddy ACME, not per-user). Old schema had `email TEXT
@@ -149,16 +210,19 @@ try {
           protocols TEXT DEFAULT '["naive","mieru"]',
           quotaMB   INTEGER DEFAULT 0,
           usedMB    REAL    DEFAULT 0,
+          enabled   INTEGER DEFAULT 1,
+          suspicious INTEGER DEFAULT 0,
+          subscriptionToken TEXT,
           createdAt TEXT NOT NULL,
           updatedAt TEXT NOT NULL,
           lastSeen  TEXT
         );
         INSERT INTO users
-          (id,email,username,passHash,password,expiry,protocols,quotaMB,usedMB,createdAt,updatedAt,lastSeen)
+          (id,email,username,passHash,password,expiry,protocols,quotaMB,usedMB,enabled,suspicious,subscriptionToken,createdAt,updatedAt,lastSeen)
         SELECT
           id,
           CASE WHEN email='' THEN NULL ELSE email END,
-          username,passHash,password,expiry,protocols,quotaMB,usedMB,createdAt,updatedAt,lastSeen
+          username,passHash,password,expiry,protocols,quotaMB,usedMB,1,0,NULL,createdAt,updatedAt,lastSeen
         FROM users_legacy;
         DROP TABLE users_legacy;
         COMMIT;
@@ -167,7 +231,27 @@ try {
     }
   } catch (e) {
     try { db.exec('ROLLBACK'); } catch {}
-    console.error('[DB] email-nullable migration skipped:', e.message);
+      console.error('[DB] email-nullable migration skipped:', e.message);
+  }
+  try {
+    const rows = db.prepare(`SELECT id FROM users WHERE subscriptionToken IS NULL OR subscriptionToken = ''`).all();
+    const stmt = db.prepare(`UPDATE users SET subscriptionToken = ? WHERE id = ?`);
+    rows.forEach(r => stmt.run(generateUniqueSubscriptionToken(), r.id));
+    const dupes = db.prepare(`
+      SELECT subscriptionToken
+      FROM users
+      WHERE subscriptionToken IS NOT NULL AND subscriptionToken <> ''
+      GROUP BY subscriptionToken
+      HAVING COUNT(*) > 1
+    `).all();
+    const updateDup = db.prepare(`UPDATE users SET subscriptionToken = ? WHERE id = ?`);
+    for (const d of dupes) {
+      const ids = db.prepare(`SELECT id FROM users WHERE subscriptionToken = ? ORDER BY createdAt, id`).all(d.subscriptionToken);
+      ids.slice(1).forEach(r => updateDup.run(generateUniqueSubscriptionToken(), r.id));
+    }
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_subscription_token ON users(subscriptionToken)`);
+  } catch (e) {
+    console.error('[DB] subscriptionToken backfill skipped:', e.message);
   }
 } catch (err) {
   console.error('[DB] SQLite unavailable:', err.message, '— using in-memory store');
@@ -189,22 +273,34 @@ function getUserById(id) {
   if (db) return db.prepare('SELECT * FROM users WHERE id = ?').get(id);
   return memUsers.get(id);
 }
+function getUserBySubscriptionToken(token) {
+  if (db) return db.prepare('SELECT * FROM users WHERE subscriptionToken = ?').get(token);
+  return [...memUsers.values()].find(u => u.subscriptionToken === token);
+}
 function upsertUser(u) {
   if (db) {
     db.prepare(`
       INSERT INTO users
-        (id,email,username,passHash,password,expiry,protocols,quotaMB,usedMB,createdAt,updatedAt,lastSeen)
+        (id,email,username,passHash,password,expiry,protocols,quotaMB,usedMB,enabled,suspicious,subscriptionToken,createdAt,updatedAt,lastSeen)
       VALUES
-        (@id,@email,@username,@passHash,@password,@expiry,@protocols,@quotaMB,@usedMB,@createdAt,@updatedAt,@lastSeen)
+        (@id,@email,@username,@passHash,@password,@expiry,@protocols,@quotaMB,@usedMB,@enabled,@suspicious,@subscriptionToken,@createdAt,@updatedAt,@lastSeen)
       ON CONFLICT(id) DO UPDATE SET
         email=excluded.email, username=excluded.username,
         passHash=excluded.passHash, password=excluded.password,
         expiry=excluded.expiry, protocols=excluded.protocols,
         quotaMB=excluded.quotaMB, usedMB=excluded.usedMB,
+        enabled=excluded.enabled, suspicious=excluded.suspicious,
+        subscriptionToken=excluded.subscriptionToken,
         updatedAt=excluded.updatedAt, lastSeen=excluded.lastSeen
-    `).run({ ...u, password: u.password || '' });
+    `).run({
+      ...u,
+      password: u.password || '',
+      enabled: u.enabled === false || u.enabled === 0 ? 0 : 1,
+      suspicious: u.suspicious ? 1 : 0,
+      subscriptionToken: u.subscriptionToken || generateSubscriptionToken()
+    });
   } else {
-    memUsers.set(u.id, u);
+    memUsers.set(u.id, { ...u, subscriptionToken: u.subscriptionToken || generateSubscriptionToken() });
   }
 }
 function deleteUser(id) {
@@ -258,6 +354,7 @@ function buildCaddyfile(config, users) {
   //         hashes the password internally; we cannot feed it a bcrypt hash.
   //         Log a warning so operators know which users are missing.
   const naiveUsers = users.filter(u => {
+    if (u.enabled === 0 || u.enabled === false) return false;
     try { return JSON.parse(u.protocols || '["naive","mieru"]').includes('naive'); }
     catch { return true; }
   }).map(u => {
@@ -289,10 +386,13 @@ function buildCaddyfile(config, users) {
       adminEmail:  config.adminEmail  || '',
       domain:      config.domain      || 'localhost',
       naivePort:   config.naivePort   || 443,
+      panelPort:   config.panelPort   || 3000,
       fakeSiteDir: resolvedFakeSiteDir,
       probeSecret,
       probeMode,
       logFile:     LOG_CADDY,
+      authAuditLogPath: (config.authAuditLogPath || '').trim(),
+      trafficAuditLogPath: (config.trafficAuditLogPath || '').trim(),
       upstream:    (config.cascadeEnabled && config.cascadeNaiveUpstream) ? config.cascadeNaiveUpstream : '',
     }, naiveUsers);
   }
@@ -327,6 +427,10 @@ function buildCaddyfile(config, users) {
   // v1.2.6: cascade — upstream proxy support (inline fallback)
   const upstreamUrl = (config.cascadeEnabled && config.cascadeNaiveUpstream) ? config.cascadeNaiveUpstream : '';
   const upstreamLine = upstreamUrl ? `\n    upstream ${upstreamUrl}` : '';
+  const authAuditLogPath = (config.authAuditLogPath || '').trim();
+  const authAuditLogLine = authAuditLogPath ? `\n    auth_audit_log ${authAuditLogPath}` : '';
+  const trafficAuditLogPath = (config.trafficAuditLogPath || '').trim();
+  const trafficAuditLogLine = trafficAuditLogPath ? `\n    traffic_audit_log ${trafficAuditLogPath}` : '';
 
   // Bug 28: no "tls <email>" inside site block
   // Bug 30: order directive in global block
@@ -360,12 +464,16 @@ function buildCaddyfile(config, users) {
   # listener + explicit tls + no route{} wrapper).
   tls ${config.adminEmail || ''}
 
+  handle /sub/* {
+    reverse_proxy 127.0.0.1:${config.panelPort || 3000}
+  }
+
   forward_proxy {
     # Bug 23: no bare "basic_auth" token; each line IS the credential directive
     # Bug 29: order — credentials → hide_ip → hide_via → probe_resistance
 ${authLines}
     hide_ip
-    hide_via${probeLine}${upstreamLine}
+    hide_via${probeLine}${authAuditLogLine}${trafficAuditLogLine}${upstreamLine}
   }
 
   file_server {
@@ -378,9 +486,141 @@ ${authLines}
 // ── writeCaddyfileAtomic() ────────────────────────────────────────────────────
 function writeCaddyfileAtomic(content) {
   fs.mkdirSync(resolvedCaddyCfgDir, { recursive: true });
+  try { execSync(`chown root:caddy ${shellQuote(resolvedCaddyCfgDir)} 2>/dev/null || true`, { timeout: 5000 }); } catch {}
+  try { execSync(`chmod 750 ${shellQuote(resolvedCaddyCfgDir)} 2>/dev/null || true`, { timeout: 5000 }); } catch {}
   const tmp = resolvedCaddyFile + '.new';
   fs.writeFileSync(tmp, content, { mode: 0o640 });
+  try { execSync(`chown root:caddy ${shellQuote(tmp)} 2>/dev/null || true`, { timeout: 5000 }); } catch {}
+  try { execSync(`chmod 640 ${shellQuote(tmp)} 2>/dev/null || true`, { timeout: 5000 }); } catch {}
   fs.renameSync(tmp, resolvedCaddyFile);   // atomic replace
+  try { execSync(`chown root:caddy ${shellQuote(resolvedCaddyFile)} 2>/dev/null || true`, { timeout: 5000 }); } catch {}
+  try { execSync(`chmod 640 ${shellQuote(resolvedCaddyFile)} 2>/dev/null || true`, { timeout: 5000 }); } catch {}
+}
+
+function generateSubscriptionToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function generateUniqueSubscriptionToken() {
+  let token = '';
+  do {
+    token = generateSubscriptionToken();
+  } while (db && db.prepare('SELECT 1 FROM users WHERE subscriptionToken = ?').get(token));
+  return token;
+}
+
+function subscriptionBaseUrl() {
+  return String(cfg.subscriptionBaseUrl || '').trim() || `https://${cfg.domain}/sub`;
+}
+
+function subscriptionUrlFor(user) {
+  return `${subscriptionBaseUrl().replace(/\/+$/, '')}/${encodeURIComponent(user.subscriptionToken || '')}`;
+}
+
+function getGitCommit() {
+  try { return execSync('git rev-parse --short HEAD 2>/dev/null', { timeout: 2000 }).toString().trim(); }
+  catch { return ''; }
+}
+
+function normalizeBackendAllowedIps(value) {
+  if (!Array.isArray(value)) return null;
+  const ips = [...new Set(value.map(v => String(v || '').trim()).filter(Boolean))];
+  if (ips.some(ip => !net.isIP(ip))) return null;
+  return ips;
+}
+
+function safeNodeSettings() {
+  return {
+    domain: cfg.domain,
+    serverIp: cfg.serverIp,
+    naivePort: cfg.naivePort || 443,
+    mieruPortStart: cfg.mieruPortStart,
+    mieruPortEnd: cfg.mieruPortEnd,
+    backendAllowedIps: Array.isArray(cfg.backendAllowedIps) ? cfg.backendAllowedIps : [],
+    allowAnyBackendIp: cfg.allowAnyBackendIp === true,
+    sessionTtlMinutes: parseInt(cfg.sessionTtlMinutes, 10) || 10,
+    authAuditLogPath: cfg.authAuditLogPath || '',
+    trafficAuditLogPath: cfg.trafficAuditLogPath || '',
+    ipHistoryTtlHours: parseInt(cfg.ipHistoryTtlHours, 10) || 24,
+    maxUniqueIpsPerUser: parseInt(cfg.maxUniqueIpsPerUser, 10) || 5,
+    enforceIpLimit: cfg.enforceIpLimit === true,
+    subscriptionBaseUrl: cfg.subscriptionBaseUrl || ''
+  };
+}
+
+function nodeAgentVersionPayload() {
+  return {
+    version: cfg.version || '1.2.6',
+    commit: getGitCommit() || undefined,
+    nodeAgent: 'vetka-node-agent',
+    features: {
+      internalApi: true,
+      activeSessions: true,
+      naive: true,
+      mieru: true
+    }
+  };
+}
+
+function applyNodeSettingsPatch(body) {
+  const patch = body || {};
+  if (patch.backendAllowedIps !== undefined) {
+    const ips = normalizeBackendAllowedIps(patch.backendAllowedIps);
+    if (!ips) return { error: 'backendAllowedIps must be an array of valid IP addresses' };
+    cfg.backendAllowedIps = ips;
+  }
+  if (patch.allowAnyBackendIp !== undefined) {
+    cfg.allowAnyBackendIp = patch.allowAnyBackendIp === true;
+  }
+  if (patch.sessionTtlMinutes !== undefined) {
+    const ttl = parseInt(patch.sessionTtlMinutes, 10);
+    if (!Number.isInteger(ttl) || ttl < 1 || ttl > 1440) return { error: 'sessionTtlMinutes must be 1..1440' };
+    cfg.sessionTtlMinutes = ttl;
+  }
+  if (patch.authAuditLogPath !== undefined) {
+    cfg.authAuditLogPath = String(patch.authAuditLogPath || '').trim();
+  }
+  if (patch.trafficAuditLogPath !== undefined) {
+    cfg.trafficAuditLogPath = String(patch.trafficAuditLogPath || '').trim();
+  }
+  if (patch.ipHistoryTtlHours !== undefined) {
+    const ttlHours = parseInt(patch.ipHistoryTtlHours, 10);
+    if (!Number.isInteger(ttlHours) || ttlHours < 1 || ttlHours > 168) return { error: 'ipHistoryTtlHours must be 1..168' };
+    cfg.ipHistoryTtlHours = ttlHours;
+  }
+  if (patch.maxUniqueIpsPerUser !== undefined) {
+    const maxIps = parseInt(patch.maxUniqueIpsPerUser, 10);
+    if (!Number.isInteger(maxIps) || maxIps < 1 || maxIps > 1000) return { error: 'maxUniqueIpsPerUser must be 1..1000' };
+    cfg.maxUniqueIpsPerUser = maxIps;
+  }
+  if (patch.enforceIpLimit !== undefined) {
+    cfg.enforceIpLimit = patch.enforceIpLimit === true;
+  }
+  if (patch.subscriptionBaseUrl !== undefined) {
+    cfg.subscriptionBaseUrl = String(patch.subscriptionBaseUrl || '').trim();
+  }
+  if (!cfg.allowAnyBackendIp && (!Array.isArray(cfg.backendAllowedIps) || cfg.backendAllowedIps.length === 0)) {
+    return { error: 'backendAllowedIps cannot be empty unless allowAnyBackendIp=true' };
+  }
+  saveConfig();
+  return { settings: safeNodeSettings() };
+}
+
+function shellQuote(v) {
+  return `'${String(v).replace(/'/g, `'\\''`)}'`;
+}
+
+function validateCaddyfile() {
+  try {
+    execFileSync(resolvedCaddyBin, ['validate', '--config', resolvedCaddyFile, '--adapter', 'caddyfile'], {
+      timeout: 15000,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    return { ok: true };
+  } catch (e) {
+    const output = (e.stdout ? e.stdout.toString() : '') + (e.stderr ? e.stderr.toString() : '') + (e.message || '');
+    return { ok: false, error: output.trim() || 'caddy validate failed' };
+  }
 }
 
 // ── reloadCaddy() — graceful reload (zero downtime) ──────────────────────────
@@ -390,16 +630,26 @@ function writeCaddyfileAtomic(content) {
 function reloadCaddy() {
   try {
     execSync('systemctl reload caddy-naive', { timeout: 10000 });
-    return true;
-  } catch { return false; }
+    return { ok: true, action: 'reload' };
+  } catch (reloadErr) {
+    try {
+      execSync('systemctl restart caddy-naive', { timeout: 15000 });
+      return { ok: true, action: 'restart' };
+    } catch (restartErr) {
+      const msg = (restartErr.stdout ? restartErr.stdout.toString() : '') ||
+        (reloadErr.stdout ? reloadErr.stdout.toString() : '') ||
+        restartErr.message || reloadErr.message || 'caddy-naive reload/restart failed';
+      return { ok: false, error: msg.trim() };
+    }
+  }
 }
 
 // ── restartCaddy() — full restart (needed for port/domain changes) ───────────
 function restartCaddy() {
   try {
     execSync('systemctl restart caddy-naive 2>/dev/null', { timeout: 15000 });
-    return true;
-  } catch { return false; }
+    return { ok: true, action: 'restart' };
+  } catch (e) { return { ok: false, error: e.message }; }
 }
 
 // ── Bug 7: UFW single-port helper ────────────────────────────────────────────
@@ -416,6 +666,7 @@ function ufwMieruRule(action, start, end, proto, comment) {
 function buildMitaStateFile() {
   const allUsers = getAllUsers();
   const mieruUsers = allUsers.filter(u => {
+    if (u.enabled === 0 || u.enabled === false) return false;
     try { return JSON.parse(u.protocols || '["naive","mieru"]').includes('mieru'); }
     catch { return true; }
   });
@@ -552,15 +803,23 @@ function shredFile(fp) {
 // Rebuilds Caddyfile, reloads Caddy, rebuilds mita state, applies mita config.
 // Called after every user CRUD operation.
 function applyAllConfigs() {
-  let caddyOk = false, mitaOk = false;
+  let caddyOk = false, mitaOk = false, caddyError = '', caddyAction = '';
   try {
     const content = buildCaddyfile(cfg, getAllUsers());
     writeCaddyfileAtomic(content);
-    caddyOk = reloadCaddy();
-  } catch (e) { console.error('[CADDY]', e.message); }
+    const validation = validateCaddyfile();
+    if (!validation.ok) {
+      caddyError = validation.error;
+    } else {
+      const applied = reloadCaddy();
+      caddyOk = applied.ok;
+      caddyAction = applied.action || '';
+      caddyError = applied.error || '';
+    }
+  } catch (e) { caddyError = e.message; console.error('[CADDY]', e.message); }
   try { mitaOk = applyMitaConfig(); }
   catch (e) { console.error('[MITA]', e.message); }
-  return { caddyOk, mitaOk, servicesReloaded: caddyOk && mitaOk };
+  return { caddyOk, mitaOk, caddyAction, caddyError, servicesReloaded: caddyOk && mitaOk };
 }
 
 // ── Express app ───────────────────────────────────────────────────────────────
@@ -656,7 +915,7 @@ app.get('/api/me', requireAuth, (req, res) => {
 
 // ── Config API ────────────────────────────────────────────────────────────────
 app.get('/api/config', requireAuth, (req, res) => {
-  const { adminPassHash, ...safe } = cfg;
+  const { adminPassHash, nodeApiKey, ...safe } = cfg;
   // Never expose secrets to the browser. Mask the cascade exit password and the
   // legacy native-egress proxy passwords; expose a boolean "set" flag instead.
   if (safe.cascadeMieru && typeof safe.cascadeMieru === 'object') {
@@ -709,7 +968,7 @@ const EMAIL_RE        = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
  * Bug 8: normalise quota — accept quotaMB or quotaGb (gb * 1024 → MB).
  * Bug 9: validate all user input fields.
  */
-function validateUserInput({ email, username, password, protocols, quotaMB, quotaGb }, requirePassword) {
+function validateUserInput({ email, username, password, protocols, quotaMB, quotaGb, enabled }, requirePassword) {
   if (!username || !USERNAME_RE.test(username))
     return { error: 'username required and must match [a-zA-Z0-9_.-] (max 64 chars)' };
   // Email is optional (TLS cert is configured at install time via Caddy ACME,
@@ -745,7 +1004,8 @@ function validateUserInput({ email, username, password, protocols, quotaMB, quot
       return { error: 'at least one protocol is required (naive, mieru)' };
     resolvedProtocols = protocols;
   }
-  return { quotaMB: resolvedQuotaMB, protocols: resolvedProtocols };
+  const resolvedEnabled = enabled === undefined ? undefined : !(enabled === false || enabled === 0 || enabled === 'false');
+  return { quotaMB: resolvedQuotaMB, protocols: resolvedProtocols, enabled: resolvedEnabled };
 }
 
 /**
@@ -754,25 +1014,836 @@ function validateUserInput({ email, username, password, protocols, quotaMB, quot
 function parseUserRow(u) {
   return {
     ...u,
+    enabled: !(u.enabled === 0 || u.enabled === false),
+    suspicious: !!u.suspicious,
     protocols: typeof u.protocols === 'string'
       ? (() => { try { return JSON.parse(u.protocols); } catch { return []; } })()
       : (u.protocols || []),
   };
 }
 
+function clientIp(req) {
+  const raw = (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || req.ip || '').toString().split(',')[0].trim();
+  return raw.replace(/^::ffff:/, '').replace(/^::1$/, '127.0.0.1');
+}
+
+function isIpAllowed(req) {
+  const allowed = Array.isArray(cfg.backendAllowedIps) ? cfg.backendAllowedIps.filter(Boolean) : [];
+  if (!allowed.length) return cfg.allowAnyBackendIp === true;
+  return allowed.includes(clientIp(req));
+}
+
+function requireInternalAuth(req, res, next) {
+  const expected = (cfg.nodeApiKey || '').trim();
+  const auth = (req.headers.authorization || '').trim();
+  if (!expected) return res.status(503).json({ ok: false, error: 'nodeApiKey is not configured' });
+  if (!isIpAllowed(req)) return res.status(403).json({ ok: false, error: 'source IP is not allowed' });
+  if (auth !== `Bearer ${expected}`) return res.status(401).json({ ok: false, error: 'invalid bearer token' });
+  next();
+}
+
+function apiUser(u) {
+  if (!u) return null;
+  const { passHash, password, ...safe } = u;
+  const parsed = parseUserRow(safe);
+  return {
+    ...parsed,
+    subscriptionUrl: parsed.subscriptionToken ? subscriptionUrlFor(parsed) : null
+  };
+}
+
+function apiUserWithTraffic(u, options = {}) {
+  return attachTrafficToUserPayload(apiUser(u), options);
+}
+
+function getUserProtocols(user) {
+  try { return JSON.parse(user.protocols || '[]'); } catch { return []; }
+}
+
+function enrichUserForList(u) {
+  const safe = apiUserWithTraffic(u);
+  const summary = getSessionSummary(u.id, u.username);
+  return {
+    ...safe,
+    activeIpCount: summary.trackingAvailable ? summary.uniqueActiveIps : null,
+    uniqueIpCount24h: summary.trackingAvailable ? summary.uniqueIpCount24h : null,
+    trackingAvailable: summary.trackingAvailable,
+    trackingReason: summary.reason || '',
+    lastSeen: summary.lastSeen || safe.lastSeen
+  };
+}
+
+function activeCutoffIso() {
+  return new Date(Date.now() - (parseInt(cfg.sessionTtlMinutes, 10) || 10) * 60000).toISOString();
+}
+
+function activeCutoffMs() {
+  return Date.now() - (parseInt(cfg.sessionTtlMinutes, 10) || 10) * 60000;
+}
+
+function ipHistoryTtlHours() {
+  return parseInt(cfg.ipHistoryTtlHours, 10) || 24;
+}
+
+function ipHistoryCutoffMs() {
+  return Date.now() - ipHistoryTtlHours() * 3600000;
+}
+
+function parseAccessLogTimestamp(value) {
+  if (value === undefined || value === null || value === '') return new Date();
+  const raw = String(value).trim();
+  if (/^\d+(\.\d+)?$/.test(raw)) {
+    const numeric = Number(raw);
+    if (!Number.isFinite(numeric)) return null;
+    return new Date(numeric < 1000000000000 ? numeric * 1000 : numeric);
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function isActiveNodeSession(session, cutoffMs = activeCutoffMs()) {
+  const lastSeenMs = Date.parse(session?.lastSeen || '');
+  return Number.isFinite(lastSeenMs) && lastSeenMs >= cutoffMs;
+}
+
+function refreshActiveSessionsFromLog() {
+  // Per-user Naive sessions are derived on demand from auth_audit_log.
+  // access.log is intentionally used only for node-level IP visibility.
+}
+
+function readLogTail(filePath, maxBytes = 1024 * 1024 * 10) {
+  if (!filePath || !fs.existsSync(filePath)) return '';
+  let fd = null;
+  try {
+    const st = fs.statSync(filePath);
+    fd = fs.openSync(filePath, 'r');
+    const len = Math.min(st.size, maxBytes);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, Math.max(0, st.size - len));
+    return buf.toString('utf8');
+  } catch {
+    return '';
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
+let trafficAuditCache = { key: '', readAtMs: 0, stats: new Map(), diagnostics: null };
+
+function trafficAuditLogPath() {
+  return String(cfg.trafficAuditLogPath || LOG_TRAFFIC_AUDIT).trim();
+}
+
+function toFiniteNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+function emptyTrafficAuditDiagnostics(logPath, available) {
+  return {
+    trafficAuditLogAvailable: available,
+    trafficAuditLogPath: logPath,
+    trafficAuditLogLastReadAt: null,
+    trafficAuditLogRecords: 0,
+    lastTrafficEvent: null
+  };
+}
+
+function getNaiveTrafficStats() {
+  const logPath = trafficAuditLogPath();
+  const now = Date.now();
+  let stat = null;
+  try { if (logPath && fs.existsSync(logPath)) stat = fs.statSync(logPath); } catch {}
+  if (!logPath || !stat) {
+    const diagnostics = emptyTrafficAuditDiagnostics(logPath, false);
+    trafficAuditCache = { key: '', readAtMs: now, stats: new Map(), diagnostics };
+    return { stats: trafficAuditCache.stats, diagnostics };
+  }
+
+  const key = `${logPath}:${stat.size}:${stat.mtimeMs}`;
+  if (trafficAuditCache.key === key && now - trafficAuditCache.readAtMs < 10000) {
+    return { stats: trafficAuditCache.stats, diagnostics: trafficAuditCache.diagnostics };
+  }
+
+  const stats = new Map();
+  let records = 0;
+  let lastTrafficEvent = null;
+  const content = readLogTail(logPath, 1024 * 1024 * 25);
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    let row;
+    try { row = JSON.parse(line); } catch { continue; }
+    if (row.event && row.event !== 'connect_closed') continue;
+    const username = String(row.username || '').trim();
+    if (!username) continue;
+
+    const uploadedBytes = toFiniteNumber(row.bytes_client_to_target);
+    const downloadedBytes = toFiniteNumber(row.bytes_target_to_client);
+    const totalBytes = toFiniteNumber(row.bytes_total, uploadedBytes + downloadedBytes);
+    const parsedTs = parseAccessLogTimestamp(row.ts ?? row.time ?? row.timestamp);
+    const lastSeen = parsedTs ? parsedTs.toISOString() : null;
+    if (lastSeen && (!lastTrafficEvent || lastSeen > lastTrafficEvent)) lastTrafficEvent = lastSeen;
+
+    const current = stats.get(username) || {
+      username,
+      uploadedMB: 0,
+      downloadedMB: 0,
+      usedMB: 0,
+      records: 0,
+      lastSeen: null
+    };
+    current.uploadedMB += uploadedBytes / 1048576;
+    current.downloadedMB += downloadedBytes / 1048576;
+    current.usedMB += totalBytes / 1048576;
+    current.records += 1;
+    if (lastSeen && (!current.lastSeen || lastSeen > current.lastSeen)) current.lastSeen = lastSeen;
+    stats.set(username, current);
+    records += 1;
+  }
+
+  const diagnostics = {
+    trafficAuditLogAvailable: true,
+    trafficAuditLogPath: logPath,
+    trafficAuditLogLastReadAt: new Date(now).toISOString(),
+    trafficAuditLogRecords: records,
+    lastTrafficEvent
+  };
+  trafficAuditCache = { key, readAtMs: now, stats, diagnostics };
+  return { stats, diagnostics };
+}
+
+function trafficForUsername(username) {
+  return getNaiveTrafficStats().stats.get(username) || {
+    username,
+    uploadedMB: 0,
+    downloadedMB: 0,
+    usedMB: 0,
+    records: 0,
+    lastSeen: null
+  };
+}
+
+function applyTrafficToUserPayload(payload, naive, options = {}) {
+  if (!payload) return payload;
+  const mieru = options.mieruTraffic || {};
+  const storedMieruUsed = options.useStoredMieru === false ? 0 : toFiniteNumber(payload.usedMB);
+  const mieruUploadedMB = toFiniteNumber(mieru.uploadMB ?? mieru.uploadedMB);
+  const mieruDownloadedMB = toFiniteNumber(mieru.downloadMB ?? mieru.downloadedMB);
+  const mieruUsedMB = toFiniteNumber(mieru.usedMB, storedMieruUsed);
+  const naiveUsedMB = toFiniteNumber(naive.usedMB);
+  const uploadedMB = toFiniteNumber(naive.uploadedMB) + mieruUploadedMB;
+  const downloadedMB = toFiniteNumber(naive.downloadedMB) + mieruDownloadedMB;
+  return {
+    ...payload,
+    usedMB: naiveUsedMB + mieruUsedMB,
+    uploadedMB,
+    downloadedMB,
+    uploadMB: uploadedMB,
+    downloadMB: downloadedMB,
+    naiveUsedMB,
+    naiveUploadedMB: toFiniteNumber(naive.uploadedMB),
+    naiveDownloadedMB: toFiniteNumber(naive.downloadedMB),
+    mieruUsedMB,
+    mieruUploadedMB,
+    mieruDownloadedMB,
+    trafficSource: naiveUsedMB > 0 ? 'naive-traffic-audit' : (mieruUsedMB > 0 ? 'mieru' : 'none'),
+    lastSeen: naive.lastSeen || mieru.lastSeen || payload.lastSeen
+  };
+}
+
+function attachTrafficToUserPayload(payload, options = {}) {
+  return applyTrafficToUserPayload(payload, trafficForUsername(payload?.username), options);
+}
+
+function getNodeSessionsFromCaddyLog() {
+  const content = readLogTail(LOG_CADDY, 1024 * 1024 * 5);
+  if (!content) return [];
+
+  const byIp = new Map();
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    let row;
+    try { row = JSON.parse(line); } catch { continue; }
+    const req = row.request || {};
+    const method = row.method || req.method || '';
+    if (method && method !== 'CONNECT') continue;
+    const remoteIp = String(req.remote_ip || row.remote_ip || row.remote_addr || '').replace(/^::ffff:/, '');
+    if (!remoteIp) continue;
+    const tsRaw = row.ts ?? row.time ?? row.timestamp ?? new Date().toISOString();
+    const parsed = parseAccessLogTimestamp(tsRaw);
+    if (!parsed) continue;
+    const seen = parsed.toISOString();
+    const host = row.host || req.host || req.uri || '';
+    const existing = byIp.get(remoteIp) || {
+      remoteIp,
+      firstSeen: seen,
+      lastSeen: seen,
+      requestCount: 0,
+      hosts: new Set(),
+      protocol: 'naive',
+      username: null
+    };
+    existing.requestCount += 1;
+    if (host) existing.hosts.add(String(host));
+    if (seen < existing.firstSeen) existing.firstSeen = seen;
+    if (seen > existing.lastSeen) existing.lastSeen = seen;
+    byIp.set(remoteIp, existing);
+  }
+  return [...byIp.values()]
+    .map(s => ({ ...s, hosts: [...s.hosts].slice(-10) }))
+    .sort((a, b) => b.lastSeen.localeCompare(a.lastSeen));
+}
+
+function authAuditLogPath() {
+  return String(cfg.authAuditLogPath || '').trim();
+}
+
+function authAuditUnavailableReason() {
+  const logPath = authAuditLogPath();
+  if (!logPath || !fs.existsSync(logPath)) return AUTH_AUDIT_LOG_UNCONFIGURED_REASON;
+  return '';
+}
+
+function sessionResetCutoffMs(username) {
+  if (!db || !username) return 0;
+  try {
+    const row = db.prepare('SELECT reset_at FROM session_resets WHERE username = ?').get(username);
+    const ms = Date.parse(row?.reset_at || '');
+    return Number.isFinite(ms) ? ms : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function normalizeAuditIp(value) {
+  const raw = String(value || '').trim().replace(/^::ffff:/, '');
+  if (!raw) return '';
+  const split = raw.match(/^\[?([0-9a-fA-F:.]+)\]?:(\d+)$/);
+  return split ? split[1] : raw;
+}
+
+let authAuditCache = { key: '', readAtMs: 0, payload: null };
+
+function emptyAuthAuditDiagnostics(logPath, available, records = 0) {
+  return {
+    authAuditLogAvailable: available,
+    authAuditLogPath: logPath,
+    authAuditLogRecords: records,
+    lastAuthEvent: null
+  };
+}
+
+function getSessionResetMap() {
+  const map = new Map();
+  if (!db) return map;
+  try {
+    for (const row of db.prepare('SELECT username, reset_at FROM session_resets').all()) {
+      const ms = Date.parse(row.reset_at || '');
+      if (row.username && Number.isFinite(ms)) map.set(row.username, ms);
+    }
+  } catch {}
+  return map;
+}
+
+function buildAuthAuditHistoryPayload() {
+  const reason = authAuditUnavailableReason();
+  const logPath = authAuditLogPath();
+  if (reason) {
+    return {
+      trackingAvailable: false,
+      reason,
+      ttlMinutes: parseInt(cfg.sessionTtlMinutes, 10) || 10,
+      ttlHours: ipHistoryTtlHours(),
+      ips: [],
+      sessions: [],
+      activeIpCount: null,
+      uniqueActiveIps: null,
+      uniqueIpCount24h: null,
+      users: [],
+      diagnostics: emptyAuthAuditDiagnostics(logPath, false, 0)
+    };
+  }
+
+  const now = Date.now();
+  let stat = null;
+  try { if (logPath && fs.existsSync(logPath)) stat = fs.statSync(logPath); } catch {}
+  const key = stat ? `${logPath}:${stat.size}:${stat.mtimeMs}:${cfg.sessionTtlMinutes}:${cfg.ipHistoryTtlHours}` : '';
+  if (authAuditCache.key === key && authAuditCache.payload && now - authAuditCache.readAtMs < 10000) {
+    return authAuditCache.payload;
+  }
+
+  const cutoffMs = activeCutoffMs();
+  const historyCutoffMs = ipHistoryCutoffMs();
+  const resetMap = getSessionResetMap();
+  const content = readLogTail(logPath, AUTH_AUDIT_MAX_BYTES);
+  if (!content) {
+    const payload = {
+      trackingAvailable: true,
+      ttlMinutes: parseInt(cfg.sessionTtlMinutes, 10) || 10,
+      ttlHours: ipHistoryTtlHours(),
+      ips: [],
+      activeIpCount: 0,
+      uniqueActiveIps: 0,
+      uniqueIpCount24h: 0,
+      users: [],
+      diagnostics: emptyAuthAuditDiagnostics(logPath, true, 0)
+    };
+    authAuditCache = { key, readAtMs: now, payload };
+    return payload;
+  }
+
+  const byUserIp = new Map();
+  let records = 0;
+  let lastAuthEvent = null;
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    let row;
+    try { row = JSON.parse(line); } catch { continue; }
+
+    const username = String(row.username || '').trim();
+    if (!username) continue;
+
+    const parsed = parseAccessLogTimestamp(row.ts ?? row.time ?? row.timestamp);
+    if (!parsed) continue;
+    const seenMs = parsed.getTime();
+    const seen = parsed.toISOString();
+    const resetMs = resetMap.get(username) || 0;
+    if (resetMs && seenMs <= resetMs) continue;
+    records += 1;
+    if (!lastAuthEvent || seen > lastAuthEvent) lastAuthEvent = seen;
+    if (seenMs < historyCutoffMs) continue;
+
+    const ip = normalizeAuditIp(row.remote_ip || row.remoteIp || row.remote_addr);
+    if (!ip) continue;
+
+    const host = String(row.host || row.uri || '').trim();
+    const key = `${username}\n${ip}`;
+    const existing = byUserIp.get(key) || {
+      username,
+      ip,
+      remoteIp: ip,
+      protocol: 'naive',
+      firstSeen: seen,
+      lastSeen: seen,
+      requestCount: 0,
+      hosts: new Set(),
+      active: false
+    };
+    existing.requestCount += 1;
+    if (host) existing.hosts.add(host);
+    if (seen < existing.firstSeen) existing.firstSeen = seen;
+    if (seen > existing.lastSeen) existing.lastSeen = seen;
+    existing.active = Date.parse(existing.lastSeen) >= cutoffMs;
+    byUserIp.set(key, existing);
+  }
+
+  const ips = [...byUserIp.values()]
+    .map(s => ({ ...s, hosts: [...s.hosts].slice(-10) }))
+    .sort((a, b) => {
+      const byUser = a.username.localeCompare(b.username);
+      return byUser || b.lastSeen.localeCompare(a.lastSeen);
+    });
+  const usersMap = new Map();
+  for (const s of ips) {
+    if (!usersMap.has(s.username)) usersMap.set(s.username, []);
+    usersMap.get(s.username).push(s);
+  }
+  const users = [...usersMap.entries()].map(([username, userSessions]) => ({
+    username,
+    activeIpCount: userSessions.filter(s => s.active).length,
+    uniqueActiveIps: userSessions.filter(s => s.active).length,
+    uniqueIpCount24h: userSessions.length,
+    sessions: userSessions.filter(s => s.active),
+    ips: userSessions
+  }));
+  const activeIps = ips.filter(s => s.active);
+  const payload = {
+    trackingAvailable: true,
+    ttlMinutes: parseInt(cfg.sessionTtlMinutes, 10) || 10,
+    ttlHours: ipHistoryTtlHours(),
+    ips,
+    sessions: activeIps,
+    activeIpCount: new Set(activeIps.map(s => s.ip)).size,
+    uniqueActiveIps: new Set(activeIps.map(s => s.ip)).size,
+    uniqueIpCount24h: new Set(ips.map(s => s.ip)).size,
+    users,
+    diagnostics: { ...emptyAuthAuditDiagnostics(logPath, true, records), lastAuthEvent }
+  };
+  authAuditCache = { key, readAtMs: now, payload };
+  return payload;
+}
+
+function filterAuthAuditHistory(payload, targetUsername = '') {
+  if (!targetUsername || !payload.trackingAvailable) return payload;
+  const ips = (payload.ips || []).filter(s => s.username === targetUsername);
+  const sessions = ips.filter(s => s.active);
+  return {
+    ...payload,
+    ips,
+    sessions,
+    activeIpCount: new Set(sessions.map(s => s.ip)).size,
+    uniqueActiveIps: new Set(sessions.map(s => s.ip)).size,
+    uniqueIpCount24h: new Set(ips.map(s => s.ip)).size,
+    users: ips.length ? [{
+      username: targetUsername,
+      activeIpCount: new Set(sessions.map(s => s.ip)).size,
+      uniqueActiveIps: new Set(sessions.map(s => s.ip)).size,
+      uniqueIpCount24h: new Set(ips.map(s => s.ip)).size,
+      sessions,
+      ips
+    }] : []
+  };
+}
+
+function parseAuthAuditSessions(targetUsername = '') {
+  return filterAuthAuditHistory(buildAuthAuditHistoryPayload(), targetUsername);
+}
+
+function nodeSessionsPayload() {
+  const cutoffMs = activeCutoffMs();
+  const sessions = getNodeSessionsFromCaddyLog()
+    .map(s => ({ ...s, active: isActiveNodeSession(s, cutoffMs) }))
+    .filter(s => s.active);
+  return {
+    sessions,
+    uniqueActiveIps: new Set(sessions.map(s => s.remoteIp)).size,
+    note: 'Node-level IPs from Caddy access.log; per-user attribution uses auth_audit_log'
+  };
+}
+
+function getUserSessions(id, username) {
+  void id;
+  return parseAuthAuditSessions(username);
+}
+
+function getSessionSummary(id, username) {
+  const payload = getUserSessions(id, username);
+  const lastSeen = payload.sessions.reduce((latest, s) => (
+    !latest || s.lastSeen > latest ? s.lastSeen : latest
+  ), null);
+  return { ...payload, lastSeen };
+}
+
+function getUserIpHistory(id, username) {
+  void id;
+  return parseAuthAuditSessions(username);
+}
+
+function formatSessionsForApi(sessions) {
+  return sessions.map(s => ({
+    username: s.username,
+    protocol: s.protocol || 'naive',
+    ip: s.ip || s.remoteIp || s.remote_ip,
+    remoteIp: s.remoteIp || s.ip || s.remote_ip,
+    firstSeen: s.firstSeen || s.first_seen,
+    lastSeen: s.lastSeen || s.last_seen,
+    requestCount: s.requestCount || 0,
+    hosts: Array.isArray(s.hosts) ? s.hosts : []
+  }));
+}
+
+function formatIpHistoryForApi(ips) {
+  return ips.map(s => ({
+    ip: s.ip || s.remoteIp || s.remote_ip,
+    remoteIp: s.remoteIp || s.ip || s.remote_ip,
+    firstSeen: s.firstSeen || s.first_seen,
+    lastSeen: s.lastSeen || s.last_seen,
+    requestCount: s.requestCount || 0,
+    active: s.active === true,
+    hosts: Array.isArray(s.hosts) ? s.hosts : []
+  }));
+}
+
+let nodeExplorerCache = { key: '', readAtMs: 0, snapshot: null };
+
+function emptyNaiveTraffic(username) {
+  return {
+    username,
+    uploadedMB: 0,
+    downloadedMB: 0,
+    usedMB: 0,
+    records: 0,
+    lastSeen: null
+  };
+}
+
+function latestIso(...values) {
+  return values.filter(Boolean).reduce((latest, value) => (
+    !latest || value > latest ? value : latest
+  ), null);
+}
+
+function getNodeExplorerSnapshot() {
+  const now = Date.now();
+  const users = getAllUsers();
+  const authPayload = buildAuthAuditHistoryPayload();
+  const trafficPayload = getNaiveTrafficStats();
+  const trafficStats = trafficPayload.stats || new Map();
+  const authDiag = authPayload.diagnostics || emptyAuthAuditDiagnostics(authAuditLogPath(), false, 0);
+  const trafficDiag = trafficPayload.diagnostics || emptyTrafficAuditDiagnostics(trafficAuditLogPath(), false);
+  const key = [
+    users.length,
+    users.map(u => `${u.id}:${u.updatedAt || ''}:${u.enabled}:${u.suspicious || 0}`).join('|'),
+    authAuditCache.key,
+    trafficAuditCache.key,
+    cfg.sessionTtlMinutes,
+    cfg.ipHistoryTtlHours
+  ].join('\n');
+
+  if (nodeExplorerCache.key === key && nodeExplorerCache.snapshot && now - nodeExplorerCache.readAtMs < NODE_EXPLORER_CACHE_TTL_MS) {
+    return nodeExplorerCache.snapshot;
+  }
+
+  const authByUsername = new Map();
+  for (const row of authPayload.users || []) authByUsername.set(row.username, row);
+
+  const activeIpSet = new Set();
+  const historyIpSet = new Set();
+  const ipIndex = new Map();
+  let trafficUsedMB = 0;
+
+  const explorerUsers = users.map(user => {
+    const auth = authByUsername.get(user.username) || { sessions: [], ips: [], activeIpCount: 0, uniqueIpCount24h: 0 };
+    const naiveTraffic = trafficStats.get(user.username) || emptyNaiveTraffic(user.username);
+    const safe = applyTrafficToUserPayload(apiUser(user), naiveTraffic);
+    const ips = auth.ips || [];
+    const sessions = auth.sessions || ips.filter(ip => ip.active);
+    const activeIpCount = sessions.length;
+    const uniqueIpCount24h = ips.length;
+    const lastSeen = latestIso(
+      safe.lastSeen,
+      naiveTraffic.lastSeen,
+      ...ips.map(ip => ip.lastSeen)
+    );
+
+    trafficUsedMB += toFiniteNumber(safe.usedMB);
+    for (const ip of ips) {
+      if (ip.active) activeIpSet.add(ip.ip);
+      historyIpSet.add(ip.ip);
+      const current = ipIndex.get(ip.ip) || {
+        ip: ip.ip,
+        users: new Set(),
+        active: false,
+        lastSeen: null,
+        firstSeen: null,
+        requestCount: 0,
+        hosts: new Set()
+      };
+      current.users.add(user.username);
+      current.active = current.active || ip.active === true;
+      current.lastSeen = latestIso(current.lastSeen, ip.lastSeen);
+      current.firstSeen = !current.firstSeen || (ip.firstSeen && ip.firstSeen < current.firstSeen) ? ip.firstSeen : current.firstSeen;
+      current.requestCount += toFiniteNumber(ip.requestCount);
+      for (const host of ip.hosts || []) current.hosts.add(host);
+      ipIndex.set(ip.ip, current);
+    }
+
+    return {
+      id: safe.id,
+      username: safe.username,
+      enabled: safe.enabled !== false,
+      suspicious: safe.suspicious === true || safe.suspicious === 1,
+      protocols: safe.protocols,
+      quotaMB: safe.quotaMB,
+      activeIpCount,
+      uniqueIpCount24h,
+      usedMB: safe.usedMB,
+      uploadedMB: safe.uploadedMB,
+      downloadedMB: safe.downloadedMB,
+      trafficSource: safe.trafficSource,
+      lastSeen,
+      ips: formatIpHistoryForApi(ips)
+    };
+  });
+
+  const usersActive = explorerUsers.filter(u => u.activeIpCount > 0).length;
+  const snapshot = {
+    generatedAt: new Date(now).toISOString(),
+    cache: {
+      ttlMs: NODE_EXPLORER_CACHE_TTL_MS,
+      refreshedAt: new Date(now).toISOString()
+    },
+    node: {
+      domain: cfg.domain,
+      serverIp: cfg.serverIp
+    },
+    summary: {
+      usersTotal: users.length,
+      usersActive,
+      activeIpsTotal: activeIpSet.size,
+      uniqueIps24hTotal: historyIpSet.size,
+      trafficUsedMB
+    },
+    users: explorerUsers,
+    ipIndex,
+    logs: {
+      authAuditLogAvailable: authDiag.authAuditLogAvailable,
+      trafficAuditLogAvailable: trafficDiag.trafficAuditLogAvailable,
+      authAuditLogPath: authDiag.authAuditLogPath,
+      trafficAuditLogPath: trafficDiag.trafficAuditLogPath,
+      authAuditLogRecords: authDiag.authAuditLogRecords,
+      trafficAuditLogRecords: trafficDiag.trafficAuditLogRecords,
+      lastAuthEvent: authDiag.lastAuthEvent || null,
+      lastTrafficEvent: trafficDiag.lastTrafficEvent || null
+    }
+  };
+  nodeExplorerCache = { key, readAtMs: now, snapshot };
+  return snapshot;
+}
+
+function publicExplorerSnapshot(snapshot = getNodeExplorerSnapshot()) {
+  const { ipIndex, ...publicPayload } = snapshot;
+  void ipIndex;
+  return publicPayload;
+}
+
+function userExplorerDetails(user) {
+  const snapshot = getNodeExplorerSnapshot();
+  const explorerUser = snapshot.users.find(u => u.id === user.id);
+  const traffic = explorerUser ? {
+    usedMB: explorerUser.usedMB,
+    uploadedMB: explorerUser.uploadedMB,
+    downloadedMB: explorerUser.downloadedMB,
+    trafficSource: explorerUser.trafficSource
+  } : {};
+  return {
+    user: explorerUser || internalUserPayload(user),
+    traffic,
+    sessions: (explorerUser?.ips || []).filter(ip => ip.active),
+    ipHistory: explorerUser?.ips || [],
+    generatedAt: snapshot.generatedAt,
+    node: snapshot.node
+  };
+}
+
+function ipExplorerDetails(ip) {
+  const normalized = normalizeAuditIp(ip);
+  const snapshot = getNodeExplorerSnapshot();
+  const found = snapshot.ipIndex.get(normalized);
+  if (!found) {
+    return {
+      ip: normalized,
+      users: [],
+      active: false,
+      lastSeen: null,
+      requestCount: 0,
+      hosts: []
+    };
+  }
+  return {
+    ip: normalized,
+    users: [...found.users].sort(),
+    active: found.active,
+    firstSeen: found.firstSeen,
+    lastSeen: found.lastSeen,
+    requestCount: found.requestCount,
+    hosts: [...found.hosts].slice(-20)
+  };
+}
+
+function unavailableUserSessionPayload() {
+  const reason = authAuditUnavailableReason() || AUTH_AUDIT_LOG_UNCONFIGURED_REASON;
+  return { sessions: [], uniqueActiveIps: null, trackingAvailable: false, reason };
+}
+
+function resetUserSessions(id, username) {
+  if (db) db.prepare('DELETE FROM active_sessions WHERE user_id = ? OR username = ?').run(id, username);
+  if (db && username) {
+    db.prepare(`
+      INSERT INTO session_resets (username, reset_at)
+      VALUES (?, ?)
+      ON CONFLICT(username) DO UPDATE SET reset_at = excluded.reset_at
+    `).run(username, new Date().toISOString());
+  }
+  authAuditCache = { key: '', readAtMs: 0, payload: null };
+  nodeExplorerCache = { key: '', readAtMs: 0, snapshot: null };
+}
+
+function dashboardSessionStats() {
+  const payload = parseAuthAuditSessions();
+  const users = payload.users || [];
+  const activeUsers = users.filter(u => u.sessions.length > 0).length;
+  const maxIps = parseInt(cfg.maxUniqueIpsPerUser, 10) || 5;
+  const exceeded = users.filter(u => u.uniqueActiveIps > maxIps).length;
+  const nodeSessions = nodeSessionsPayload();
+  return {
+    activeUsers: payload.trackingAvailable ? activeUsers : null,
+    activeIps: nodeSessions.uniqueActiveIps,
+    perUserActiveIps: payload.trackingAvailable ? payload.uniqueActiveIps : null,
+    ipLimitExceededUsers: payload.trackingAvailable ? exceeded : null
+  };
+}
+
+function assertCaddyApplied(status) {
+  if (!status.caddyOk) {
+    const err = new Error(status.caddyError || 'caddy-naive failed to validate or apply config');
+    err.status = 500;
+    throw err;
+  }
+}
+
 // ── Users API ─────────────────────────────────────────────────────────────────
 app.get('/api/users', requireAuth, (req, res) => {
-  const users = getAllUsers().map(u => {
-    const { passHash, password, ...rest } = u;
-    return parseUserRow(rest);
-  });
+  const users = getAllUsers().map(enrichUserForList);
   res.json(users);
 });
 
+app.get('/api/users/sessions', requireAuth, (_req, res) => {
+  const payload = parseAuthAuditSessions();
+  res.json({
+    ok: true,
+    trackingAvailable: payload.trackingAvailable,
+    reason: payload.reason,
+    ttlMinutes: payload.ttlMinutes,
+    ttlHours: payload.ttlHours,
+    uniqueActiveIps: payload.uniqueActiveIps,
+    uniqueIpCount24h: payload.uniqueIpCount24h,
+    users: (payload.users || []).map(u => ({
+      username: u.username,
+      uniqueActiveIps: u.uniqueActiveIps,
+      activeIpCount: u.activeIpCount,
+      uniqueIpCount24h: u.uniqueIpCount24h,
+      sessions: formatSessionsForApi(u.sessions),
+      ips: formatIpHistoryForApi(u.ips || [])
+    }))
+  });
+});
+
+app.get('/api/users/:id', requireAuth, (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  res.json(enrichUserForList(user));
+});
+
+app.get('/api/node-api/settings', requireAuth, (req, res) => {
+  res.json({
+    ok: true,
+    nodeApiKey: cfg.nodeApiKey || '',
+    status: (cfg.nodeApiKey && (cfg.allowAnyBackendIp || (Array.isArray(cfg.backendAllowedIps) && cfg.backendAllowedIps.length > 0))) ? 'ready' : 'locked',
+    version: nodeAgentVersionPayload(),
+    settings: safeNodeSettings()
+  });
+});
+
+app.patch('/api/node-api/settings', requireAuth, (req, res) => {
+  const result = applyNodeSettingsPatch(req.body);
+  if (result.error) return res.status(400).json({ ok: false, error: result.error });
+  res.json({ ok: true, settings: result.settings });
+});
+
+app.post('/api/node-api/regenerate-key', requireAuth, (_req, res) => {
+  cfg.nodeApiKey = crypto.randomBytes(32).toString('hex');
+  saveConfig();
+  res.json({ ok: true, nodeApiKey: cfg.nodeApiKey });
+});
+
 app.post('/api/users', requireAuth, (req, res) => {
-  const { email, username, password, expiry, protocols, quotaMB, quotaGb } = req.body;
+  const { email, username, password, protocols, quotaMB, quotaGb, enabled } = req.body;
+  const expiry = req.body.expiry ?? req.body.expiresAt;
   const validation = validateUserInput(
-    { email, username, password, protocols, quotaMB, quotaGb }, true);
+    { email, username, password, protocols, quotaMB, quotaGb, enabled }, true);
   if (validation.error)
     return res.status(400).json({ error: validation.error });
 
@@ -794,6 +1865,9 @@ app.post('/api/users', requireAuth, (req, res) => {
     expiry:    expiry || null,
     protocols: JSON.stringify(validation.protocols),
     quotaMB:   validation.quotaMB,
+    enabled:   validation.enabled === undefined ? 1 : (validation.enabled ? 1 : 0),
+    suspicious: 0,
+    subscriptionToken: generateSubscriptionToken(),
     usedMB:    0,
     createdAt: now, updatedAt: now, lastSeen: null
   };
@@ -801,23 +1875,30 @@ app.post('/api/users', requireAuth, (req, res) => {
 
   // Bug 6: rebuild Caddyfile + reload Caddy; rebuild mita state; report status
   const svcStatus = applyAllConfigs();
+  try { assertCaddyApplied(svcStatus); }
+  catch (e) {
+    deleteUser(user.id);
+    applyAllConfigs();
+    return res.status(e.status || 500).json({ ok: false, error: e.message, ...svcStatus });
+  }
 
-  const { passHash, password: _p, ...safe } = user;
-  res.status(201).json({ ok: true, ...parseUserRow(safe), ...svcStatus });
+  res.status(201).json({ ok: true, ...apiUserWithTraffic(user), ...svcStatus });
 });
 
-app.put('/api/users/:id', requireAuth, (req, res) => {
+function handleUserUpdate(req, res) {
   const user = getUserById(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
 
-  const { email, username, password, expiry, protocols, quotaMB, quotaGb } = req.body;
+  const { email, username, password, protocols, quotaMB, quotaGb, enabled } = req.body;
+  const expiry = req.body.expiry ?? req.body.expiresAt;
   const validation = validateUserInput(
     { email: email ?? user.email,
       username: username ?? user.username,
       password,
       protocols,
       quotaMB: quotaMB !== undefined ? quotaMB : undefined,
-      quotaGb: quotaGb !== undefined ? quotaGb : undefined }, false);
+      quotaGb: quotaGb !== undefined ? quotaGb : undefined,
+      enabled }, false);
   if (validation.error)
     return res.status(400).json({ error: validation.error });
 
@@ -835,6 +1916,7 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
     quotaMB:   (quotaMB !== undefined || quotaGb !== undefined)
       ? validation.quotaMB
       : user.quotaMB,
+    enabled:   validation.enabled === undefined ? user.enabled : (validation.enabled ? 1 : 0),
     updatedAt: new Date().toISOString()
   };
   if (password) {
@@ -844,17 +1926,84 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
   upsertUser(updated);
 
   const svcStatus = applyAllConfigs();
+  try { assertCaddyApplied(svcStatus); }
+  catch (e) {
+    upsertUser(user);
+    applyAllConfigs();
+    return res.status(e.status || 500).json({ ok: false, error: e.message, ...svcStatus });
+  }
 
-  const { passHash, password: _p, ...safe } = updated;
-  res.json({ ok: true, ...parseUserRow(safe), ...svcStatus });
-});
+  res.json({ ok: true, ...apiUserWithTraffic(updated), ...svcStatus });
+}
+
+app.put('/api/users/:id', requireAuth, handleUserUpdate);
+app.patch('/api/users/:id', requireAuth, handleUserUpdate);
 
 app.delete('/api/users/:id', requireAuth, (req, res) => {
   const user = getUserById(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
   deleteUser(req.params.id);
   const svcStatus = applyAllConfigs();
+  try { assertCaddyApplied(svcStatus); }
+  catch (e) {
+    upsertUser(user);
+    applyAllConfigs();
+    return res.status(e.status || 500).json({ ok: false, error: e.message, ...svcStatus });
+  }
   res.json({ ok: true, ...svcStatus });
+});
+
+app.get('/api/users/:id/sessions', requireAuth, (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  const payload = getUserSessions(user.id, user.username);
+  res.json({
+    ok: true,
+    trackingAvailable: payload.trackingAvailable,
+    reason: payload.reason,
+    ttlMinutes: payload.ttlMinutes,
+    ttlHours: payload.ttlHours,
+    uniqueActiveIps: payload.uniqueActiveIps,
+    uniqueIpCount24h: payload.uniqueIpCount24h,
+    sessions: formatSessionsForApi(payload.sessions)
+  });
+});
+
+app.get('/api/users/:id/ip-history', requireAuth, (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  const payload = getUserIpHistory(user.id, user.username);
+  res.json({
+    ok: true,
+    trackingAvailable: payload.trackingAvailable,
+    reason: payload.reason,
+    username: user.username,
+    ttlMinutes: payload.ttlMinutes,
+    ttlHours: payload.ttlHours,
+    activeIpCount: payload.activeIpCount,
+    uniqueActiveIps: payload.uniqueActiveIps,
+    uniqueIpCount24h: payload.uniqueIpCount24h,
+    ips: formatIpHistoryForApi(payload.ips || [])
+  });
+});
+
+app.post('/api/users/:id/reset-sessions', requireAuth, (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  resetUserSessions(user.id, user.username);
+  res.json({ ok: true });
+});
+
+app.get('/api/node/sessions', requireAuth, (_req, res) => {
+  res.json({ ok: true, ...nodeSessionsPayload() });
+});
+
+app.post('/api/users/:id/rotate-subscription-token', requireAuth, (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  const updated = { ...user, subscriptionToken: generateSubscriptionToken(), updatedAt: new Date().toISOString() };
+  upsertUser(updated);
+  res.json({ ok: true, user: apiUserWithTraffic(updated) });
 });
 
 // ── Server settings ───────────────────────────────────────────────────────────
@@ -869,7 +2018,10 @@ app.post('/api/settings/naive-port', requireAuth, (req, res) => {
   try {
     const content = buildCaddyfile(cfg, getAllUsers());
     writeCaddyfileAtomic(content);
-    restartCaddy();
+    const validation = validateCaddyfile();
+    if (!validation.ok) return res.status(500).json({ ok: false, error: validation.error });
+    const restarted = restartCaddy();
+    if (!restarted.ok) return res.status(500).json({ ok: false, error: restarted.error });
     // Bug 52: confirm the service is actually running after restart
     let active = false;
     try { execSync('systemctl is-active caddy-naive', { timeout: 8000 }); active = true; } catch {}
@@ -971,8 +2123,11 @@ app.post('/api/settings/probe-secret', requireAuth, (req, res) => {
   try {
     const content = buildCaddyfile(cfg, getAllUsers());
     writeCaddyfileAtomic(content);
-    const ok = reloadCaddy();
-    res.json({ ok, message: 'Probe secret updated. Caddy reloaded.' });
+    const validation = validateCaddyfile();
+    if (!validation.ok) return res.status(500).json({ ok: false, error: validation.error });
+    const applied = reloadCaddy();
+    if (!applied.ok) return res.status(500).json({ ok: false, error: applied.error });
+    res.json({ ok: true, caddyAction: applied.action, message: 'Probe secret updated. Caddy reloaded.' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1006,8 +2161,11 @@ app.post('/api/settings/probe-mode', requireAuth, (req, res) => {
   try {
     const content = buildCaddyfile(cfg, getAllUsers());
     writeCaddyfileAtomic(content);
-    const ok = reloadCaddy();
-    res.json({ ok, probeMode: mode, message: `probe_resistance mode set to '${mode}'. Caddy reloaded.` });
+    const validation = validateCaddyfile();
+    if (!validation.ok) return res.status(500).json({ ok: false, error: validation.error });
+    const applied = reloadCaddy();
+    if (!applied.ok) return res.status(500).json({ ok: false, error: applied.error });
+    res.json({ ok: true, caddyAction: applied.action, probeMode: mode, message: `probe_resistance mode set to '${mode}'. Caddy reloaded.` });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1016,9 +2174,12 @@ app.post('/api/services/rebuild-all', requireAuth, (req, res) => {
   try {
     const content = buildCaddyfile(cfg, getAllUsers());
     writeCaddyfileAtomic(content);
-    const caddyOk = reloadCaddy();
+    const validation = validateCaddyfile();
+    if (!validation.ok) return res.status(500).json({ ok: false, error: validation.error });
+    const caddy = reloadCaddy();
+    if (!caddy.ok) return res.status(500).json({ ok: false, error: caddy.error });
     const mitaOk  = applyMitaConfig();
-    res.json({ ok: true, caddyOk, mitaOk,
+    res.json({ ok: true, caddyOk: true, caddyAction: caddy.action, mitaOk,
       message: 'Caddyfile and mita-state.json rebuilt from database.' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1077,7 +2238,10 @@ app.post('/api/settings/cascade', requireAuth, (req, res) => {
     // 1) Naive leg — rebuild Caddyfile (upstream applied when enabled).
     const content = buildCaddyfile(cfg, getAllUsers());
     writeCaddyfileAtomic(content);
-    const caddyOk = reloadCaddy();
+    const validation = validateCaddyfile();
+    if (!validation.ok) return res.status(500).json({ ok: false, error: validation.error });
+    const caddy = reloadCaddy();
+    if (!caddy.ok) return res.status(500).json({ ok: false, error: caddy.error });
 
     // 2) Mieru leg — Variant B orchestration.
     let cascadeOk = true, cascadeOut = '';
@@ -1099,8 +2263,8 @@ app.post('/api/settings/cascade', requireAuth, (req, res) => {
     const mitaOk = applyMitaConfig();
 
     res.json({
-      ok: caddyOk && cascadeOk,
-      caddyOk, mitaOk, cascadeOk,
+      ok: cascadeOk,
+      caddyOk: true, caddyAction: caddy.action, mitaOk, cascadeOk,
       cascadeOutput: cascadeOut,
       message: enabled
         ? (hasMieruExit
@@ -1117,6 +2281,8 @@ app.post('/api/settings/cascade', requireAuth, (req, res) => {
 app.get('/api/users/:id/config/naive', requireAuth, (req, res) => {
   const user = getUserById(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
+  if (user.enabled === 0 || !getUserProtocols(user).includes('naive'))
+    return res.status(404).json({ error: 'Naive protocol is not active for this user' });
   const password = req.query.password || user.password || 'YOUR_PASSWORD';
   // naive+https:// link for caddy-forwardproxy-naive
   const link = `naive+https://${user.username}:${encodeURIComponent(password)}@${cfg.domain}:${cfg.naivePort}`;
@@ -1137,6 +2303,8 @@ function pickMieruPort(requested, start, end) {
 app.get('/api/users/:id/config/mieru', requireAuth, (req, res) => {
   const user = getUserById(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
+  if (user.enabled === 0 || !getUserProtocols(user).includes('mieru'))
+    return res.status(404).json({ error: 'Mieru protocol is not active for this user' });
   const password = req.query.password || user.password || 'YOUR_PASSWORD';
 
   // Build server_ports array (Bug 12)
@@ -1195,13 +2363,49 @@ app.get('/api/users/:id/config/mieru', requireAuth, (req, res) => {
 app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
   const user = getUserById(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
+  if (user.enabled === 0) return res.status(403).json({ error: 'User is disabled' });
   const password = req.query.password || user.password || 'YOUR_PASSWORD';
+  const protocols = getUserProtocols(user);
+  const hasNaive = protocols.includes('naive');
+  const hasMieru = protocols.includes('mieru');
+  if (!hasNaive && !hasMieru) return res.status(404).json({ error: 'No active protocol for this user' });
 
   // Bug 70: parseInt guard prevents an infinite loop when values are strings/NaN
   const _portStart70b = parseInt(cfg.mieruPortStart, 10) || 2000;
   const _portEnd70b   = parseInt(cfg.mieruPortEnd,   10) || 2010;
   // P3 (selectable port): honour ?port= within the configured range.
   const mieruPortU = pickMieruPort(req.query.port, _portStart70b, _portEnd70b);
+
+  const outbounds = [];
+  const routeFinal = hasNaive && hasMieru ? 'select' : (hasNaive ? 'node-naive' : 'mieru-out');
+  if (hasNaive && hasMieru) {
+    outbounds.push({
+      type: 'urltest', tag: 'select',
+      outbounds: ['node-naive', 'mieru-out'],
+      url: 'https://www.gstatic.com/generate_204',
+      interval: '3m', tolerance: 50
+    });
+  }
+  if (hasNaive) {
+    outbounds.push({
+      type: 'naive', tag: 'node-naive',
+      server: cfg.domain, server_port: cfg.naivePort,
+      username: user.username, password,
+      quic: false,
+      tls: { enabled: true, server_name: cfg.domain }
+    });
+  }
+  if (hasMieru) {
+    outbounds.push({
+      type: 'mieru', tag: 'mieru-out',
+      server: cfg.serverIp || cfg.domain,
+      server_port: mieruPortU,
+      transport: 'TCP',
+      username: user.username, password,
+      multiplexing: 'MULTIPLEXING_HIGH'
+    });
+  }
+  outbounds.push({ type: 'direct', tag: 'direct' }, { type: 'dns', tag: 'dns-out' });
 
   const universalCfg = {
     log: { level: 'info', timestamp: true },
@@ -1213,50 +2417,14 @@ app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
       rules:  [{ outbound: 'any', server: 'local' }],
       final:  'remote'
     },
-    outbounds: [
-      {
-        type: 'urltest', tag: 'select',
-        outbounds: ['naive-out', 'mieru-out'],
-        url: 'https://www.gstatic.com/generate_204',
-        interval: '3m', tolerance: 50
-      },
-      {
-        // Bug 87: NaiveProxy outbound MUST be type "naive", NOT "http".
-        // A plain `type:http` is an ordinary HTTP-CONNECT proxy; it completes
-        // TLS + CONNECT but lacks NaiveProxy's Cronet/Chromium traffic shaping
-        // (HTTP/2 framing, padding, header order) that the caddy-forwardproxy
-        // server expects — so the manual `naive+https://…` key worked while the
-        // subscription's http outbound did not. Karing bundles the
-        // with_naive_outbound build (libcronet), so type:naive works there.
-        // `quic:false` matches the server's global `servers { protocols h1 h2 }`
-        // (Bug 80 — HTTP/3 disabled); tls only carries server_name (the only
-        // TLS field the naive outbound honours besides certificate/ech).
-        type: 'naive', tag: 'naive-out',
-        server: cfg.domain, server_port: cfg.naivePort,
-        username: user.username, password,
-        quic: false,
-        tls: { enabled: true, server_name: cfg.domain }
-      },
-      {
-        // Bug 74: working mieru format — string `multiplexing`, single port,
-        // no `server_ports` array, no `multiplex` object.
-        type: 'mieru', tag: 'mieru-out',
-        server: cfg.serverIp || cfg.domain,
-        server_port: mieruPortU,
-        transport: 'TCP',
-        username: user.username, password,
-        multiplexing: 'MULTIPLEXING_HIGH'
-      },
-      { type: 'direct', tag: 'direct' },
-      { type: 'dns',    tag: 'dns-out' }
-    ],
+    outbounds,
     route: {
       rules: [
         { protocol: 'dns', outbound: 'dns-out' },
         { geoip: 'cn',     outbound: 'direct'  },
         { geosite: 'cn',   outbound: 'direct'  }
       ],
-      final: 'select',
+      final: routeFinal,
       auto_detect_interface: true
     }
   };
@@ -1277,6 +2445,345 @@ app.get('/api/users/:id/universal-config', requireAuth, (req, res) => {
   res.redirect(307, `/api/users/${req.params.id}/config/universal${req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : ''}`);
 });
 
+const internalRouter = express.Router();
+internalRouter.use(apiLimiter, requireInternalAuth);
+
+function internalOk(res, payload = {}) { res.json({ ok: true, ...payload }); }
+function internalUserPayload(user) {
+  const summary = getSessionSummary(user.id, user.username);
+  const safe = apiUserWithTraffic(user);
+  return {
+    ...safe,
+    activeIpCount: summary.uniqueActiveIps,
+    uniqueIpCount24h: summary.uniqueIpCount24h,
+    lastSeen: summary.lastSeen || safe.lastSeen || user.lastSeen
+  };
+}
+function buildNaiveConfig(user) {
+  return {
+    protocol: 'naive',
+    domain: cfg.domain,
+    port: cfg.naivePort || 443,
+    username: user.username,
+    password: user.password || '',
+    enabled: !(user.enabled === 0 || user.enabled === false),
+    outbound: {
+      type: 'naive',
+      tag: 'node-naive',
+      server: cfg.domain,
+      server_port: cfg.naivePort || 443,
+      username: user.username,
+      password: user.password || '',
+      quic: false,
+      tls: { enabled: true, server_name: cfg.domain }
+    }
+  };
+}
+function buildMieruOutbound(user, requestedPort) {
+  const start = parseInt(cfg.mieruPortStart, 10) || 2000;
+  const end = parseInt(cfg.mieruPortEnd, 10) || 2010;
+  return {
+    type: 'mieru',
+    tag: 'mieru-out',
+    server: cfg.serverIp || cfg.domain,
+    server_port: pickMieruPort(requestedPort, start, end),
+    transport: 'TCP',
+    username: user.username,
+    password: user.password || '',
+    multiplexing: 'MULTIPLEXING_HIGH'
+  };
+}
+function buildUniversalConfig(user, requestedPort) {
+  const protocols = getUserProtocols(user);
+  const hasNaive = protocols.includes('naive');
+  const hasMieru = protocols.includes('mieru');
+  const final = hasNaive && hasMieru ? 'select' : (hasNaive ? 'node-naive' : 'mieru-out');
+  const outbounds = [];
+  if (hasNaive && hasMieru) {
+    outbounds.push({
+      type: 'urltest', tag: 'select',
+      outbounds: ['node-naive', 'mieru-out'],
+      url: 'https://www.gstatic.com/generate_204',
+      interval: '3m', tolerance: 50
+    });
+  }
+  if (hasNaive) outbounds.push(buildNaiveConfig(user).outbound);
+  if (hasMieru) outbounds.push(buildMieruOutbound(user, requestedPort));
+  outbounds.push({ type: 'direct', tag: 'direct' }, { type: 'dns', tag: 'dns-out' });
+  return {
+    log: { level: 'info', timestamp: true },
+    dns: {
+      servers: [
+        { tag: 'remote', address: 'tls://8.8.8.8', detour: final },
+        { tag: 'local', address: 'https://223.5.5.5/dns-query', detour: 'direct' }
+      ],
+      rules: [{ outbound: 'any', server: 'local' }],
+      final: 'remote'
+    },
+    outbounds,
+    route: {
+      rules: [
+        { protocol: 'dns', outbound: 'dns-out' },
+        { geoip: 'cn', outbound: 'direct' },
+        { geosite: 'cn', outbound: 'direct' }
+      ],
+      final,
+      auto_detect_interface: true
+    }
+  };
+}
+
+function userIsExpired(user) {
+  return !!(user && user.expiry && new Date(user.expiry).getTime() <= Date.now());
+}
+
+function assertSubscriptionUserUsable(user) {
+  if (!user) return { status: 404, error: 'Subscription not found' };
+  if (user.enabled === 0 || user.enabled === false) return { status: 403, error: 'User is disabled' };
+  if (userIsExpired(user)) return { status: 403, error: 'User subscription is expired' };
+  return null;
+}
+
+function setUserEnabled(req, res, enabled) {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ ok: false, error: 'User not found' });
+  const updated = { ...user, enabled: enabled ? 1 : 0, updatedAt: new Date().toISOString() };
+  upsertUser(updated);
+  const status = applyAllConfigs();
+  try { assertCaddyApplied(status); }
+  catch (e) {
+    upsertUser(user);
+    applyAllConfigs();
+    return res.status(e.status || 500).json({ ok: false, error: e.message, ...status });
+  }
+  internalOk(res, { user: internalUserPayload(updated), ...status });
+}
+
+internalRouter.get('/health', (_req, res) => internalOk(res));
+internalRouter.get('/version', (_req, res) => internalOk(res, nodeAgentVersionPayload()));
+internalRouter.get('/settings', (_req, res) => internalOk(res, { settings: safeNodeSettings() }));
+internalRouter.patch('/settings', (req, res) => {
+  const result = applyNodeSettingsPatch(req.body);
+  if (result.error) return res.status(400).json({ ok: false, error: result.error });
+  internalOk(res, { settings: result.settings });
+});
+internalRouter.get('/node/info', (_req, res) => internalOk(res, {
+  node: {
+    domain: cfg.domain,
+    serverIp: cfg.serverIp,
+    naivePort: cfg.naivePort || 443,
+    mieruPortStart: cfg.mieruPortStart,
+    mieruPortEnd: cfg.mieruPortEnd,
+    sessionTtlMinutes: cfg.sessionTtlMinutes,
+    trafficAuditLogPath: cfg.trafficAuditLogPath || LOG_TRAFFIC_AUDIT,
+    ipHistoryTtlHours: parseInt(cfg.ipHistoryTtlHours, 10) || 24,
+    maxUniqueIpsPerUser: cfg.maxUniqueIpsPerUser,
+    enforceIpLimit: !!cfg.enforceIpLimit,
+    subscriptionBaseUrl: cfg.subscriptionBaseUrl || subscriptionBaseUrl()
+  }
+}));
+internalRouter.get('/node/sessions', (_req, res) => internalOk(res, nodeSessionsPayload()));
+internalRouter.get('/sessions/explorer', (_req, res) => internalOk(res, publicExplorerSnapshot()));
+internalRouter.get('/logs/status', (_req, res) => internalOk(res, getNodeExplorerSnapshot().logs));
+internalRouter.get('/ip/:ip', (req, res) => {
+  const ip = normalizeAuditIp(req.params.ip);
+  if (!ip) return res.status(400).json({ ok: false, error: 'ip is required' });
+  internalOk(res, ipExplorerDetails(ip));
+});
+internalRouter.get('/users', (_req, res) => internalOk(res, { users: getAllUsers().map(internalUserPayload) }));
+internalRouter.get('/users/sessions', (_req, res) => {
+  const payload = parseAuthAuditSessions();
+  internalOk(res, {
+    trackingAvailable: payload.trackingAvailable,
+    reason: payload.reason,
+    ttlMinutes: payload.ttlMinutes,
+    ttlHours: payload.ttlHours,
+    uniqueActiveIps: payload.uniqueActiveIps,
+    uniqueIpCount24h: payload.uniqueIpCount24h,
+    users: (payload.users || []).map(u => ({
+      username: u.username,
+      uniqueActiveIps: u.uniqueActiveIps,
+      activeIpCount: u.activeIpCount,
+      uniqueIpCount24h: u.uniqueIpCount24h,
+      sessions: formatSessionsForApi(u.sessions),
+      ips: formatIpHistoryForApi(u.ips || [])
+    }))
+  });
+});
+internalRouter.get('/users/:id/details', (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ ok: false, error: 'User not found' });
+  internalOk(res, userExplorerDetails(user));
+});
+internalRouter.get('/users/:id', (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ ok: false, error: 'User not found' });
+  internalOk(res, { user: internalUserPayload(user) });
+});
+internalRouter.post('/users', (req, res) => {
+  const body = req.body || {};
+  const expiry = body.expiresAt ?? body.expiry;
+  const validation = validateUserInput(body, true);
+  if (validation.error) return res.status(400).json({ ok: false, error: validation.error });
+  if (getUserByUsername(body.username)) return res.status(409).json({ ok: false, error: 'Username already exists' });
+  if (expiry && isNaN(Date.parse(expiry))) return res.status(400).json({ ok: false, error: 'expiresAt must be a valid ISO date string' });
+  const now = new Date().toISOString();
+  const user = {
+    id: uuidv4(),
+    email: (body.email && body.email.trim()) ? body.email.trim() : null,
+    username: body.username,
+    passHash: bcrypt.hashSync(body.password, 12),
+    password: body.password,
+    expiry: expiry || null,
+    protocols: JSON.stringify(validation.protocols),
+    quotaMB: validation.quotaMB,
+    usedMB: 0,
+    enabled: validation.enabled === undefined ? 1 : (validation.enabled ? 1 : 0),
+    suspicious: 0,
+    subscriptionToken: generateSubscriptionToken(),
+    createdAt: now,
+    updatedAt: now,
+    lastSeen: null
+  };
+  upsertUser(user);
+  const status = applyAllConfigs();
+  try { assertCaddyApplied(status); }
+  catch (e) {
+    deleteUser(user.id);
+    applyAllConfigs();
+    return res.status(e.status || 500).json({ ok: false, error: e.message, ...status });
+  }
+  res.status(201).json({ ok: true, user: internalUserPayload(user), ...status });
+});
+internalRouter.patch('/users/:id', (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ ok: false, error: 'User not found' });
+  const body = req.body || {};
+  const expiry = body.expiresAt ?? body.expiry;
+  const validation = validateUserInput({
+    email: body.email ?? user.email,
+    username: body.username ?? user.username,
+    password: body.password,
+    protocols: body.protocols,
+    quotaGb: body.quotaGb,
+    quotaMB: body.quotaMB,
+    enabled: body.enabled
+  }, false);
+  if (validation.error) return res.status(400).json({ ok: false, error: validation.error });
+  if (expiry !== undefined && expiry !== null && isNaN(Date.parse(expiry)))
+    return res.status(400).json({ ok: false, error: 'expiresAt must be a valid ISO date string' });
+  const updated = {
+    ...user,
+    email: body.email !== undefined ? ((body.email && body.email.trim()) ? body.email.trim() : null) : user.email,
+    username: body.username ?? user.username,
+    expiry: expiry !== undefined ? (expiry || null) : user.expiry,
+    protocols: body.protocols ? JSON.stringify(validation.protocols) : user.protocols,
+    quotaMB: (body.quotaMB !== undefined || body.quotaGb !== undefined) ? validation.quotaMB : user.quotaMB,
+    enabled: validation.enabled === undefined ? user.enabled : (validation.enabled ? 1 : 0),
+    updatedAt: new Date().toISOString()
+  };
+  if (body.password) {
+    updated.passHash = bcrypt.hashSync(body.password, 12);
+    updated.password = body.password;
+  }
+  upsertUser(updated);
+  const status = applyAllConfigs();
+  try { assertCaddyApplied(status); }
+  catch (e) {
+    upsertUser(user);
+    applyAllConfigs();
+    return res.status(e.status || 500).json({ ok: false, error: e.message, ...status });
+  }
+  internalOk(res, { user: internalUserPayload(updated), ...status });
+});
+internalRouter.delete('/users/:id', (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ ok: false, error: 'User not found' });
+  deleteUser(req.params.id);
+  resetUserSessions(user.id, user.username);
+  const status = applyAllConfigs();
+  try { assertCaddyApplied(status); }
+  catch (e) {
+    upsertUser(user);
+    applyAllConfigs();
+    return res.status(e.status || 500).json({ ok: false, error: e.message, ...status });
+  }
+  internalOk(res, status);
+});
+internalRouter.post('/users/:id/enable', (req, res) => setUserEnabled(req, res, true));
+internalRouter.post('/users/:id/disable', (req, res) => setUserEnabled(req, res, false));
+internalRouter.get('/users/:id/config/naive', (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ ok: false, error: 'User not found' });
+  if (user.enabled === 0 || !getUserProtocols(user).includes('naive')) return res.status(404).json({ ok: false, error: 'Naive protocol is not active for this user' });
+  internalOk(res, { config: buildNaiveConfig(user) });
+});
+internalRouter.get('/users/:id/config/mieru', (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ ok: false, error: 'User not found' });
+  if (user.enabled === 0 || !getUserProtocols(user).includes('mieru')) return res.status(404).json({ ok: false, error: 'Mieru protocol is not active for this user' });
+  internalOk(res, { config: buildMieruOutbound(user, req.query.port) });
+});
+internalRouter.get('/users/:id/config/universal', (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ ok: false, error: 'User not found' });
+  if (user.enabled === 0) return res.status(403).json({ ok: false, error: 'User is disabled' });
+  internalOk(res, { config: buildUniversalConfig(user, req.query.port) });
+});
+internalRouter.get('/users/:id/sessions', (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ ok: false, error: 'User not found' });
+  const payload = getUserSessions(user.id, user.username);
+  internalOk(res, {
+    trackingAvailable: payload.trackingAvailable,
+    reason: payload.reason,
+    ttlMinutes: payload.ttlMinutes,
+    ttlHours: payload.ttlHours,
+    uniqueActiveIps: payload.uniqueActiveIps,
+    uniqueIpCount24h: payload.uniqueIpCount24h,
+    sessions: formatSessionsForApi(payload.sessions)
+  });
+});
+internalRouter.get('/users/:id/ip-history', (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ ok: false, error: 'User not found' });
+  const payload = getUserIpHistory(user.id, user.username);
+  internalOk(res, {
+    trackingAvailable: payload.trackingAvailable,
+    reason: payload.reason,
+    username: user.username,
+    ttlMinutes: payload.ttlMinutes,
+    ttlHours: payload.ttlHours,
+    activeIpCount: payload.activeIpCount,
+    uniqueActiveIps: payload.uniqueActiveIps,
+    uniqueIpCount24h: payload.uniqueIpCount24h,
+    ips: formatIpHistoryForApi(payload.ips || [])
+  });
+});
+internalRouter.post('/users/:id/reset-sessions', (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ ok: false, error: 'User not found' });
+  resetUserSessions(user.id, user.username);
+  internalOk(res);
+});
+internalRouter.post('/users/:id/rotate-subscription-token', (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ ok: false, error: 'User not found' });
+  const updated = { ...user, subscriptionToken: generateSubscriptionToken(), updatedAt: new Date().toISOString() };
+  upsertUser(updated);
+  internalOk(res, { user: internalUserPayload(updated) });
+});
+
+app.use('/internal', internalRouter);
+
+app.get('/sub/:token', (req, res) => {
+  const user = getUserBySubscriptionToken(req.params.token);
+  const blocked = assertSubscriptionUserUsable(user);
+  if (blocked) return res.status(blocked.status).json({ ok: false, error: blocked.error });
+  res.setHeader('Content-Type', 'application/json');
+  res.json(buildUniversalConfig(user, req.query.port));
+});
+
 // ── Monitoring — /api/status ──────────────────────────────────────────────────
 app.get('/api/status', requireAuth, async (req, res) => {
   try {
@@ -1289,6 +2796,7 @@ app.get('/api/status', requireAuth, async (req, res) => {
     const caddyActive  = exec_('systemctl is-active caddy-naive') === 'active';
     const caddyVersion = exec_(`${resolvedCaddyBin} version 2>/dev/null | head -1`) ||
                          exec_(`${resolvedCaddyBin} --version 2>/dev/null | head -1`);
+    const sessionStats = dashboardSessionStats();
 
     res.json({
       services: {
@@ -1312,7 +2820,13 @@ app.get('/api/status', requireAuth, async (req, res) => {
         os:   osInfo.distro + ' ' + osInfo.release,
         arch: osInfo.arch
       },
-      panel:    { userCount: getAllUsers().length, version: cfg.version || '1.2.5' },
+      panel:    {
+        userCount: getAllUsers().length,
+        activeUsers: sessionStats.activeUsers,
+        activeIps: sessionStats.activeIps,
+        ipLimitExceededUsers: sessionStats.ipLimitExceededUsers,
+        version: cfg.version || '1.2.5'
+      },
       domain:   cfg.domain,
       serverIp: cfg.serverIp,
       language: cfg.language || 'ru'
@@ -1330,18 +2844,16 @@ app.get('/api/stats/users', requireAuth, (req, res) => {
   const live  = parseMitaUsers(raw);
   const users = getAllUsers().map(u => {
     const s = live.find(x => x.username === u.username) || {};
-    return {
+    return attachTrafficToUserPayload({
       username:   u.username,
       email:      u.email,
       expiry:     u.expiry,
       protocols:  JSON.parse(u.protocols || '[]'),
       quotaMB:    u.quotaMB,
-      usedMB:     (s.usedMB != null ? s.usedMB : (u.usedMB || 0)),
-      uploadMB:   s.uploadMB   || 0,
-      downloadMB: s.downloadMB || 0,
+      usedMB:     u.usedMB || 0,
       // Prefer the live LastActive reported by mita; fall back to stored value.
       lastSeen:   s.lastSeen || u.lastSeen
-    };
+    }, { mieruTraffic: s });
   });
   res.json(users);
 });
@@ -1440,6 +2952,8 @@ app.get('/api/diagnostics', requireAuth, async (_req, res) => {
   for (const p of [cfg.mieruPortStart, cfg.mieruPortEnd]) {
     if (p && chkPort(p)) mieruPortsListening.push(p);
   }
+  const trafficDiag = getNaiveTrafficStats().diagnostics || emptyTrafficAuditDiagnostics(trafficAuditLogPath(), false);
+  const authDiag = buildAuthAuditHistoryPayload().diagnostics || emptyAuthAuditDiagnostics(authAuditLogPath(), false, 0);
 
   res.json({
     ports: {
@@ -1463,6 +2977,14 @@ app.get('/api/diagnostics', requireAuth, async (_req, res) => {
     mitaConfig:   exec_('mita describe config 2>/dev/null'),
     timeSynced:   exec_('timedatectl status 2>/dev/null').includes('synchronized: yes'),
     mitaStateFile: resolvedMitaFile,
+    trafficAuditLogAvailable: trafficDiag.trafficAuditLogAvailable,
+    trafficAuditLogPath: trafficDiag.trafficAuditLogPath,
+    trafficAuditLogLastReadAt: trafficDiag.trafficAuditLogLastReadAt,
+    trafficAuditLogRecords: trafficDiag.trafficAuditLogRecords,
+    ipHistoryTtlHours: parseInt(cfg.ipHistoryTtlHours, 10) || 24,
+    authAuditLogAvailable: authDiag.authAuditLogAvailable,
+    authAuditLogPath: authDiag.authAuditLogPath,
+    authAuditLogRecords: authDiag.authAuditLogRecords,
     probeSecretSet: !!(cfg.probeSecret),
     probeMode: (cfg.probeMode || (cfg.probeSecret ? 'secret' : 'bare'))
   });

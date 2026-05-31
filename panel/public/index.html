@@ -267,6 +267,7 @@
             <thead>
               <tr>
                 <th data-i18n="users.username">Username</th>
+                <th>Status</th>
                 <th data-i18n="users.email">Email</th>
                 <th data-i18n="users.expiry">Expiry</th>
                 <th data-i18n="users.naive">Naive</th>
@@ -274,12 +275,13 @@
                 <th data-i18n="users.usedMB">Used (MB)</th>
                 <th data-i18n="users.quotaMB">Quota (MB)</th>
                 <th data-i18n="users.quotaUsed">Quota</th>
+                <th title="Active IPs / unique IPs in the last 24h from forwardproxy auth_audit_log">Active / 24h</th>
                 <th data-i18n="users.lastActive">Last Active</th>
                 <th data-i18n="users.actions">Actions</th>
               </tr>
             </thead>
             <tbody id="users-tbody">
-              <tr><td colspan="10" class="table-empty" data-i18n="users.loading">Loading users…</td></tr>
+              <tr><td colspan="12" class="table-empty" data-i18n="users.loading">Loading users…</td></tr>
             </tbody>
           </table>
         </div>
@@ -330,6 +332,7 @@
                 <div class="checkbox-row">
                   <label class="checkbox"><input type="checkbox" id="p-naive" checked /> <span data-i18n="users.naiveProxyLabel">NaiveProxy</span></label>
                   <label class="checkbox"><input type="checkbox" id="p-mieru" checked /> <span data-i18n="users.mieruLabel">Mieru</span></label>
+                  <label class="checkbox"><input type="checkbox" id="u-enabled" checked /> <span>Enabled</span></label>
                 </div>
               </div>
             </div>
@@ -338,6 +341,42 @@
           <div class="modal-footer">
             <button class="btn btn-ghost" data-action="close-user-modal" data-i18n="users.cancel">Cancel</button>
             <button class="btn btn-primary" id="btn-save-user" data-action="save-user" data-i18n="users.save">Save User</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- IP history modal -->
+      <div class="modal-overlay hidden" id="ip-history-modal">
+        <div class="modal">
+          <div class="modal-header">
+            <h4 id="ip-history-title">IP History</h4>
+            <button class="modal-close" data-action="close-ip-history-modal" aria-label="Close">вњ•</button>
+          </div>
+          <div class="modal-body">
+            <div class="info-list" style="margin-bottom:12px">
+              <div class="info-row"><span>Active IPs</span><span id="ip-history-active">вЂ”</span></div>
+              <div class="info-row"><span>Unique IPs 24h</span><span id="ip-history-unique">вЂ”</span></div>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>IP</th>
+                    <th>Status</th>
+                    <th>First Seen</th>
+                    <th>Last Seen</th>
+                    <th>Requests</th>
+                    <th>Recent Hosts</th>
+                  </tr>
+                </thead>
+                <tbody id="ip-history-tbody">
+                  <tr><td colspan="6" class="table-empty">Loading...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-ghost" data-action="close-ip-history-modal">Close</button>
           </div>
         </div>
       </div>
@@ -364,6 +403,7 @@
               </p>
             </div>
             <div id="naive-link-box" class="code-box hidden"></div>
+            <div id="subscription-link-box" class="code-box hidden"></div>
             <div id="qr-container" class="qr-container hidden">
               <canvas id="qr-canvas"></canvas>
               <div class="qr-note" data-i18n="config.qrNote">Scan QR code with client app (iOS: ShadowRocket, Karing)</div>
@@ -392,6 +432,61 @@
     <section id="page-settings" class="content-page">
       <div class="page-header"><h3 data-i18n="settings.title">Server Settings</h3></div>
       <div class="grid grid-2">
+
+        <div class="card">
+          <div class="card-header">Vetka Node API</div>
+          <div class="card-body">
+            <div class="info-list" style="margin-bottom:12px">
+              <div class="info-row"><span>Internal API</span><span id="node-api-status">—</span></div>
+              <div class="info-row"><span>Domain</span><span id="node-api-domain">—</span></div>
+              <div class="info-row"><span>Server IP</span><span id="node-api-server-ip">—</span></div>
+              <div class="info-row"><span>Node-agent</span><span id="node-api-version">—</span></div>
+            </div>
+            <div class="form-group">
+              <label>nodeApiKey</label>
+              <div style="display:flex;gap:8px;align-items:center">
+                <input type="password" id="node-api-key" readonly autocomplete="off" />
+                <button class="btn btn-secondary" data-action="copy-node-api-key">Copy</button>
+                <button class="btn btn-danger" data-action="regenerate-node-api-key">Regenerate</button>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>backendAllowedIps</label>
+              <textarea id="node-api-allowed-ips" rows="4" placeholder="127.0.0.1&#10;203.0.113.10"></textarea>
+              <small style="color:var(--text-muted)">One backend IP per line. Empty list is rejected unless allowAnyBackendIp is enabled.</small>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>sessionTtlMinutes</label>
+                <input type="number" id="node-api-session-ttl" min="1" max="1440" value="10" />
+              </div>
+              <div class="form-group">
+                <label>maxUniqueIpsPerUser</label>
+                <input type="number" id="node-api-max-ips" min="1" max="1000" value="5" />
+              </div>
+            </div>
+            <div class="form-group">
+              <label>authAuditLogPath</label>
+              <input type="text" id="node-api-auth-audit-log" placeholder="/var/log/caddy-naive/auth-audit.log" />
+              <small style="color:var(--text-muted)">forward_proxy auth_audit_log JSONL path. Leave empty to disable per-user session tracking.</small>
+            </div>
+            <label class="checkbox" style="margin-bottom:8px">
+              <input type="checkbox" id="node-api-enforce-ip-limit" />
+              <span>enforceIpLimit</span>
+            </label>
+            <label class="checkbox" style="margin-bottom:12px">
+              <input type="checkbox" id="node-api-allow-any-ip" />
+              <span>allowAnyBackendIp</span>
+            </label>
+            <div class="form-group">
+              <label>subscriptionBaseUrl</label>
+              <input type="text" id="node-api-subscription-base-url" placeholder="https://node.example.com/sub" />
+              <small style="color:var(--text-muted)">Leave empty to use https://&lt;domain&gt;/sub for local node subscriptions.</small>
+            </div>
+            <button class="btn btn-primary" data-action="save-node-api-settings">Save Node API settings</button>
+            <div id="node-api-msg" class="msg-inline hidden"></div>
+          </div>
+        </div>
 
         <!-- Probe Secret card -->
         <div class="card">
@@ -653,6 +748,79 @@
         <div class="metric-chip"><span class="metric-label" data-i18n="monitoring.naiveProxy">NaiveProxy</span><span class="metric-val" id="m-naive">—</span></div>
         <div class="metric-chip"><span class="metric-label" data-i18n="monitoring.mieru">Mieru</span><span class="metric-val" id="m-mieru">—</span></div>
         <div class="metric-chip"><span class="metric-label" data-i18n="monitoring.uptime">Uptime</span><span class="metric-val" id="m-uptime">—</span></div>
+      </div>
+
+      <div class="card mt-4">
+        <div class="card-header">Per-user Active Sessions <span id="user-active-ip-count" class="badge badge-gray">—</span></div>
+        <div class="card-body">
+          <div class="table-wrap">
+            <table class="data-table" id="user-sessions-table">
+              <thead>
+                <tr>
+                  <th>Username</th>
+                  <th>IP</th>
+                  <th>Last Seen</th>
+                  <th>Requests</th>
+                  <th>Hosts</th>
+                </tr>
+              </thead>
+              <tbody id="user-sessions-tbody">
+                <tr><td colspan="5" class="table-empty">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="card mt-4">
+        <div class="card-header">Node Active IPs <span id="node-active-ip-count" class="badge badge-gray">—</span></div>
+        <div class="card-body">
+          <p style="margin-bottom:12px;color:var(--text-secondary);font-size:13px">
+            Node-level activity from Caddy access.log. User attribution is shown separately from auth_audit_log.
+          </p>
+          <div class="table-wrap">
+            <table class="data-table" id="node-sessions-table">
+              <thead>
+                <tr>
+                  <th>Remote IP</th>
+                  <th>Protocol</th>
+                  <th>Username</th>
+                  <th>Last Seen</th>
+                  <th>Requests</th>
+                  <th>Recent Hosts</th>
+                </tr>
+              </thead>
+              <tbody id="node-sessions-tbody">
+                <tr><td colspan="6" class="table-empty">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="card mt-4">
+        <div class="card-header">Per-user IP History 24h <span id="user-history-ip-count" class="badge badge-gray">вЂ”</span></div>
+        <div class="card-body">
+          <div class="table-wrap">
+            <table class="data-table" id="user-ip-history-table">
+              <thead>
+                <tr>
+                  <th>Username</th>
+                  <th>Active</th>
+                  <th>Unique 24h</th>
+                  <th>IP</th>
+                  <th>Status</th>
+                  <th>Last Seen</th>
+                  <th>Requests</th>
+                  <th>Hosts</th>
+                </tr>
+              </thead>
+              <tbody id="user-ip-history-tbody">
+                <tr><td colspan="8" class="table-empty">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
       </div>
 
       <div class="card mt-4">

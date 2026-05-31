@@ -60,7 +60,13 @@ LEGACY_NAIVE_CONFIG_DIR="/etc/naive"
 CADDY_NAIVE_RELEASES="https://api.github.com/repos/klzgrad/forwardproxy/releases/latest"
 CADDY_NAIVE_FALLBACK_URL="https://github.com/klzgrad/forwardproxy/releases/download/v2.10.0-naive/caddy-forwardproxy-naive.tar.xz"
 MIERU_RELEASES="https://api.github.com/repos/enfein/mieru/releases/latest"
-REPO_URL="https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX"
+PANEL_REPO_URL="${PANEL_REPO_URL:-https://github.com/Daniil-GR/panel_node_agent}"
+PANEL_REPO_BRANCH="${PANEL_REPO_BRANCH:-main}"
+REPO_URL="$PANEL_REPO_URL"
+CADDY_MODE="${CADDY_MODE:-vetka}"
+VETKA_CADDY_REPO="${VETKA_CADDY_REPO:-https://github.com/Daniil-GR/caddy-forwardproxy-vetka.git}"
+VETKA_CADDY_BRANCH="${VETKA_CADDY_BRANCH:-naive}"
+VETKA_CADDY_BUILD_DIR="${VETKA_CADDY_BUILD_DIR:-/opt/caddy-forwardproxy-vetka}"
 
 # ── Flags ─────────────────────────────────────────────────────────────────────
 DRY_RUN=false
@@ -176,6 +182,33 @@ migrate_config() {
     if jq '.probeMode = "bare"' "$PANEL_CONFIG" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
       cat "$tmp" > "$PANEL_CONFIG"
       log_info "Config migrated: probeMode='bare' (matches reference server) ✓"
+    fi
+    rm -f "$tmp"
+  fi
+  local has_audit; has_audit=$(jq -r 'has("authAuditLogPath")' "$PANEL_CONFIG" 2>/dev/null)
+  if [[ "$has_audit" != "true" ]]; then
+    local tmp; tmp=$(mktemp)
+    if jq '.authAuditLogPath = "/var/log/caddy-naive/auth-audit.log"' "$PANEL_CONFIG" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+      cat "$tmp" > "$PANEL_CONFIG"
+      log_info "Config migrated: authAuditLogPath enabled for per-user sessions ✓"
+    fi
+    rm -f "$tmp"
+  fi
+  local has_traffic_audit; has_traffic_audit=$(jq -r 'has("trafficAuditLogPath")' "$PANEL_CONFIG" 2>/dev/null)
+  if [[ "$has_traffic_audit" != "true" ]]; then
+    local tmp; tmp=$(mktemp)
+    if jq '.trafficAuditLogPath = "/var/log/caddy-naive/traffic-audit.log"' "$PANEL_CONFIG" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+      cat "$tmp" > "$PANEL_CONFIG"
+      log_info "Config migrated: trafficAuditLogPath enabled for traffic accounting ✓"
+    fi
+    rm -f "$tmp"
+  fi
+  local has_ip_history_ttl; has_ip_history_ttl=$(jq -r 'has("ipHistoryTtlHours")' "$PANEL_CONFIG" 2>/dev/null)
+  if [[ "$has_ip_history_ttl" != "true" ]]; then
+    local tmp; tmp=$(mktemp)
+    if jq '.ipHistoryTtlHours = 24' "$PANEL_CONFIG" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+      cat "$tmp" > "$PANEL_CONFIG"
+      log_info "Config migrated: ipHistoryTtlHours=24 ✓"
     fi
     rm -f "$tmp"
   fi
@@ -344,6 +377,8 @@ if (fs.existsSync(TEMPLATE_JS)) {
     probeSecret,
     probeMode,
     logFile:     '/var/log/caddy-naive/access.log',
+    authAuditLogPath: cfg.authAuditLogPath || '/var/log/caddy-naive/auth-audit.log',
+    trafficAuditLogPath: cfg.trafficAuditLogPath || '/var/log/caddy-naive/traffic-audit.log',
     upstream:    (cfg.cascadeEnabled && cfg.cascadeNaiveUpstream) ? cfg.cascadeNaiveUpstream : ''
   }, naiveUsers);
 } else {
@@ -360,6 +395,10 @@ if (fs.existsSync(TEMPLATE_JS)) {
   if (probeMode === 'off') probeLine = '';
   else if (probeMode === 'secret' && probeSecret) probeLine = '\n    probe_resistance ' + probeSecret;
   else probeLine = '\n    probe_resistance';
+  const authAuditLogPath = (cfg.authAuditLogPath || '').trim();
+  const authAuditLogLine = authAuditLogPath ? '\n    auth_audit_log ' + authAuditLogPath : '';
+  const trafficAuditLogPath = (cfg.trafficAuditLogPath || '').trim();
+  const trafficAuditLogLine = trafficAuditLogPath ? '\n    traffic_audit_log ' + trafficAuditLogPath : '';
   content = [
     '{',
     '  order forward_proxy before file_server',
@@ -388,7 +427,7 @@ if (fs.existsSync(TEMPLATE_JS)) {
     '  forward_proxy {',
     authLines,
     '    hide_ip',
-    '    hide_via' + probeLine,
+    '    hide_via' + probeLine + authAuditLogLine + trafficAuditLogLine,
     '  }',
     '',
     '  file_server {',
@@ -553,12 +592,105 @@ fix_caddy_perms() {
   # caddy also needs its data/log dirs owned correctly
   mkdir -p /var/log/caddy-naive /var/lib/caddy 2>/dev/null || true
   chown -R caddy:caddy /var/log/caddy-naive /var/lib/caddy 2>/dev/null || true
+  touch /var/log/caddy-naive/auth-audit.log 2>/dev/null || true
+  touch /var/log/caddy-naive/traffic-audit.log 2>/dev/null || true
+  chown caddy:caddy /var/log/caddy-naive/auth-audit.log 2>/dev/null || true
+  chown caddy:caddy /var/log/caddy-naive/traffic-audit.log 2>/dev/null || true
+  chmod 600 /var/log/caddy-naive/auth-audit.log 2>/dev/null || true
+  chmod 600 /var/log/caddy-naive/traffic-audit.log 2>/dev/null || true
   log_info "caddy-naive config permissions fixed (dir 750, files 640, owner root:caddy) ✓"
 }
 
-# ── v1.2.3: Update caddy-forwardproxy-naive (amd64 only) ─────────────────────
-update_caddy_naive() {
-  log_step "Checking caddy-forwardproxy-naive update"
+# ── Caddy-forwardproxy-naive binary ───────────────────────────────────────────
+ensure_xcaddy() {
+  if ! command -v git &>/dev/null || ! command -v go &>/dev/null || ! command -v strings &>/dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git golang-go build-essential ca-certificates binutils
+  fi
+  if ! command -v xcaddy &>/dev/null; then
+    GOBIN=/usr/local/bin go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+  fi
+}
+
+verify_vetka_caddy() {
+  local caddy_bin="${1:-$CADDY_BIN}"
+  local test_cfg; test_cfg=$(mktemp /tmp/vetka-caddy-XXXXXX.Caddyfile)
+  local adapt_err; adapt_err=$(mktemp /tmp/vetka-caddy-adapt-XXXXXX.err)
+  cat > "$test_cfg" <<'CADDYTEST'
+:0 {
+  forward_proxy {
+    auth_audit_log /tmp/auth-audit.log
+    traffic_audit_log /tmp/traffic-audit.log
+  }
+}
+CADDYTEST
+  local adapt_out=""
+  if ! adapt_out=$("$caddy_bin" adapt --config "$test_cfg" --adapter caddyfile 2>"$adapt_err"); then
+    log_error "Vetka Caddy adapt failed:"
+    cat "$adapt_err" >&2 || true
+    echo "$adapt_out" >&2
+    rm -f "$test_cfg" "$adapt_err"
+    return 1
+  fi
+  local ok=true
+  if echo "$adapt_out" | grep -q '"auth_audit_log"'; then
+    log_info "Vetka Caddy supports auth_audit_log ✓"
+  else
+    log_error "Vetka Caddy adapt output does not contain auth_audit_log"
+    ok=false
+  fi
+  if echo "$adapt_out" | grep -q '"traffic_audit_log"'; then
+    log_info "Vetka Caddy supports traffic_audit_log ✓"
+  else
+    log_error "Vetka Caddy adapt output does not contain traffic_audit_log"
+    ok=false
+  fi
+  if $ok; then
+    rm -f "$test_cfg" "$adapt_err"
+    return 0
+  fi
+  log_error "adapt stderr:"
+  cat "$adapt_err" >&2 || true
+  log_error "adapt stdout:"
+  echo "$adapt_out" >&2
+  strings "$caddy_bin" | grep -q 'auth_audit_log' || log_error "Binary strings do not contain auth_audit_log."
+  strings "$caddy_bin" | grep -q 'traffic_audit_log' || log_error "Binary strings do not contain traffic_audit_log."
+  rm -f "$test_cfg" "$adapt_err"
+  return 1
+}
+
+update_vetka_caddy_naive() {
+  log_step "Building Vetka patched caddy-forwardproxy"
+  detect_arch
+  if [[ "$ARCH" != "amd64" ]]; then
+    log_warn "Vetka caddy-forwardproxy is currently installed only on amd64 (current arch: $ARCH)"
+    return
+  fi
+  $DRY_RUN && { log_dry "Would build Vetka Caddy from $VETKA_CADDY_REPO branch $VETKA_CADDY_BRANCH"; return; }
+  ensure_xcaddy
+  if [[ -d "$VETKA_CADDY_BUILD_DIR/.git" ]]; then
+    git -C "$VETKA_CADDY_BUILD_DIR" fetch origin "$VETKA_CADDY_BRANCH"
+    git -C "$VETKA_CADDY_BUILD_DIR" checkout "$VETKA_CADDY_BRANCH"
+    git -C "$VETKA_CADDY_BUILD_DIR" reset --hard "origin/$VETKA_CADDY_BRANCH"
+  else
+    rm -rf "$VETKA_CADDY_BUILD_DIR"
+    git clone --depth 1 --branch "$VETKA_CADDY_BRANCH" "$VETKA_CADDY_REPO" "$VETKA_CADDY_BUILD_DIR"
+  fi
+  local tmp_dir; tmp_dir=$(mktemp -d)
+  xcaddy build --output "$tmp_dir/caddy-naive" \
+    --with "github.com/caddyserver/forwardproxy@master=${VETKA_CADDY_BUILD_DIR}"
+  verify_vetka_caddy "$tmp_dir/caddy-naive" || die "Vetka Caddy build does not support auth_audit_log"
+  systemctl stop caddy-naive 2>/dev/null || true
+  install -m 755 "$tmp_dir/caddy-naive" "$CADDY_BIN"
+  rm -rf "$tmp_dir"
+  command -v setcap &>/dev/null && setcap 'cap_net_bind_service=+ep' "$CADDY_BIN" 2>/dev/null || true
+  fix_caddy_perms
+  systemctl reset-failed caddy-naive 2>/dev/null || true
+  systemctl start caddy-naive 2>/dev/null || true
+  log_info "Vetka caddy-naive updated ✓"
+}
+
+update_upstream_caddy_naive() {
+  log_step "Checking upstream caddy-forwardproxy-naive update"
   detect_arch
 
   if [[ "$ARCH" != "amd64" ]]; then
@@ -651,6 +783,14 @@ update_caddy_naive() {
 }
 
 # ── Update Mieru ──────────────────────────────────────────────────────────────
+update_caddy_naive() {
+  case "${CADDY_MODE:-vetka}" in
+    vetka) update_vetka_caddy_naive ;;
+    upstream) update_upstream_caddy_naive ;;
+    *) die "Unsupported CADDY_MODE=${CADDY_MODE}. Use vetka or upstream." ;;
+  esac
+}
+
 update_mieru() {
   log_step "Checking Mieru update"
   detect_arch
@@ -678,9 +818,27 @@ update_mieru() {
   local deb; deb=$(mktemp /tmp/mieru-XXXXXX.deb)
   wget -q -O "$deb" "$asset_url"
   systemctl stop mita 2>/dev/null || true
-  dpkg -i "$deb" 2>/dev/null || apt-get install -f -y
+  local policy_rc_created=false
+  if [[ ! -e /usr/sbin/policy-rc.d ]]; then
+    cat > /usr/sbin/policy-rc.d <<'POLICYRC'
+#!/bin/sh
+exit 101
+POLICYRC
+    chmod +x /usr/sbin/policy-rc.d
+    policy_rc_created=true
+  fi
+  local install_ok=true
+  dpkg -i "$deb" 2>/dev/null || apt-get install -f -y || install_ok=false
+  if $policy_rc_created; then rm -f /usr/sbin/policy-rc.d; fi
+  $install_ok || { log_warn "Mieru package install failed"; rm -f "$deb"; return; }
   rm -f "$deb"
-  systemctl start mita 2>/dev/null || true
+  if python3 -c "import json; d=json.load(open('$MITA_STATE_FILE')); raise SystemExit(0 if len(d.get('users', [])) > 0 else 1)" 2>/dev/null; then
+    systemctl start mita 2>/dev/null || true
+  else
+    systemctl stop mita 2>/dev/null || true
+    systemctl reset-failed mita 2>/dev/null || true
+    log_info "mita has no users yet; leaving service stopped/idle"
+  fi
   log_info "Mieru updated to $remote_tag ✓"
 }
 
@@ -694,13 +852,13 @@ update_mieru() {
 # npm install non-fatally, restart PM2, and verify a known sentinel landed.
 update_panel() {
   log_step "Updating web panel"
-  $DRY_RUN && { log_dry "Would pull latest panel from $REPO_URL"; return; }
+  $DRY_RUN && { log_dry "Would pull latest panel from $PANEL_REPO_URL ($PANEL_REPO_BRANCH)"; return; }
 
   local tmp; tmp=$(mktemp -d)
   local src=""
-  if git clone --depth 1 "${REPO_URL}.git" "$tmp" 2>/dev/null && [[ -d "$tmp/panel" ]]; then
+  if git clone --depth 1 --branch "$PANEL_REPO_BRANCH" "$PANEL_REPO_URL" "$tmp" 2>/dev/null && [[ -d "$tmp/panel" ]]; then
     src="$tmp/panel"
-    log_info "Fetched latest panel from $REPO_URL"
+    log_info "Fetched latest panel from $PANEL_REPO_URL"
   elif [[ -d "$(pwd)/panel" ]]; then
     # Fallback: use the local checkout the operator already `git pull`-ed.
     src="$(pwd)/panel"
@@ -730,6 +888,9 @@ update_panel() {
   else
     log_warn "Panel files copied but v1.2.6 marker not found — check $PANEL_DIR"
   fi
+  grep -q "ip-history" "$PANEL_DIR/server/index.js" || die "Installed stale panel: ip-history endpoint not found"
+  grep -q "trafficAuditLogPath" "$PANEL_DIR/server/index.js" || die "Installed stale panel: trafficAuditLogPath not found"
+  grep -q "uniqueIpCount24h" "$PANEL_DIR/server/index.js" || die "Installed stale panel: uniqueIpCount24h not found"
   rm -rf "$tmp"
 }
 
@@ -993,8 +1154,14 @@ FAKEHTML
     systemctl restart caddy-naive 2>/dev/null && \
     log_info "caddy-naive reloaded ✓" || \
     log_warn "caddy-naive reload failed — journalctl -u caddy-naive -n 20"
-  systemctl restart mita 2>/dev/null && log_info "mita restarted ✓" || \
-    log_warn "mita restart failed — journalctl -u mita -n 20"
+  if python3 -c "import json; d=json.load(open('$MITA_STATE_FILE')); raise SystemExit(0 if len(d.get('users', [])) > 0 else 1)" 2>/dev/null; then
+    systemctl restart mita 2>/dev/null && log_info "mita restarted ✓" || \
+      log_warn "mita restart failed — journalctl -u mita -n 20"
+  else
+    systemctl stop mita 2>/dev/null || true
+    systemctl reset-failed mita 2>/dev/null || true
+    log_info "mita has no users yet; leaving service stopped/idle"
+  fi
   pm2 restart panel-naive-mieru 2>/dev/null || true
 
   smoke_test || log_warn "Some smoke tests failed — check above"

@@ -43,11 +43,14 @@ const crypto = require('crypto');
  *   .adminEmail   {string}  ACME email (used in global block)
  *   .domain       {string}  VPN domain
  *   .naivePort    {number}  HTTPS port (default 443)
+ *   .panelPort    {number}  local Express panel port for /sub/* proxy (default 3000)
  *   .fakeSiteDir  {string}  path to fake-site root
  *   .probeSecret  {string}  probe_resistance token (used only when probeMode='secret')
  *   .probeMode    {string}  'off' | 'bare' | 'secret' (optional; derived from
  *                           probeSecret when unset — non-empty→'secret', empty→'bare')
  *   .logFile      {string}  caddy access log path (optional)
+ *   .authAuditLogPath {string} forwardproxy auth audit JSONL path (optional)
+ *   .trafficAuditLogPath {string} forwardproxy traffic audit JSONL path (optional)
  *   .upstream     {string}  upstream proxy URL, e.g. https://user:pass@exit.example.com:443 (optional)
  * @param {Array<{username:string, password:string}>} naiveUsers
  *   Users with naive protocol enabled.  password must be the PLAINTEXT
@@ -58,9 +61,12 @@ function render(cfg, naiveUsers) {
   const email      = (cfg.adminEmail  || '').trim();
   const domain     = (cfg.domain      || 'localhost').trim();
   const port       = cfg.naivePort   || 443;
+  const panelPort  = cfg.panelPort   || 3000;
   const fakeSite   = (cfg.fakeSiteDir || '/var/www/fake-site').trim();
   const probeSecret = (cfg.probeSecret || '').trim();
   const logFile    = (cfg.logFile     || '/var/log/caddy-naive/access.log').trim();
+  const authAuditLogPath = (cfg.authAuditLogPath || '').trim();
+  const trafficAuditLogPath = (cfg.trafficAuditLogPath || '').trim();
 
   // ── Bug 23 + 34: basic_auth credential lines ──────────────────────────────
   // caddy-forwardproxy-naive forward_proxy block accepts:
@@ -109,6 +115,12 @@ function render(cfg, naiveUsers) {
   const upstreamLine = upstreamUrl
     ? `\n    upstream ${upstreamUrl}`
     : '';
+  const authAuditLogLine = authAuditLogPath
+    ? `\n    auth_audit_log ${authAuditLogPath}`
+    : '';
+  const trafficAuditLogLine = trafficAuditLogPath
+    ? `\n    traffic_audit_log ${trafficAuditLogPath}`
+    : '';
 
   // ── Bug 28: no redundant  tls <email>  inside the site block  ────────────
   // Caddy's automatic HTTPS handles TLS for domains that resolve to this
@@ -149,12 +161,16 @@ function render(cfg, naiveUsers) {
   #     (ordering comes from the global "order forward_proxy before file_server")
   tls ${email}
 
+  handle /sub/* {
+    reverse_proxy 127.0.0.1:${panelPort}
+  }
+
   forward_proxy {
     # Bug 23: no bare "basic_auth" token; each line IS the credential directive
     # Bug 29: order — credentials → hide_ip → hide_via → probe_resistance
 ${authLines}
     hide_ip
-    hide_via${probeLine}${upstreamLine}
+    hide_via${probeLine}${authAuditLogLine}${trafficAuditLogLine}${upstreamLine}
   }
 
   file_server {

@@ -218,6 +218,10 @@ function handleDelegatedClick(e) {
     case 'save-user':        saveUser(); break;
     case 'edit-user':        openEditUser(btn.dataset.id); break;
     case 'delete-user':      deleteUser(btn.dataset.id, btn.dataset.username); break;
+    case 'toggle-user-enabled': toggleUserEnabled(btn.dataset.id, btn.dataset.enabled === 'true'); break;
+    case 'reset-user-sessions': resetUserSessions(btn.dataset.id); break;
+    case 'open-ip-history': openIpHistory(btn.dataset.id); break;
+    case 'close-ip-history-modal': closeIpHistoryModal(); break;
     case 'open-config':      openConfigDownload(btn.dataset.id); break;
     case 'close-config-modal': closeConfigModal(); break;
     case 'dl-naive-link':    downloadNaiveLink(); break;
@@ -236,6 +240,9 @@ function handleDelegatedClick(e) {
     case 'change-password':      changePassword(); break;
     case 'change-probe-secret':  changeProbeSecret(); break;
     case 'apply-probe-mode':     applyProbeMode(); break;
+    case 'copy-node-api-key':    copyNodeApiKey(); break;
+    case 'save-node-api-settings': saveNodeApiSettings(); break;
+    case 'regenerate-node-api-key': regenerateNodeApiKey(); break;
     case 'change-cascade':       changeCascade(); break;
     case 'cascade-status':       checkCascadeStatus(); break;
 
@@ -392,7 +399,7 @@ async function loadDashboard() {
       t('dashboard.active'), t('dashboard.inactive'));
     el('d-mieru-status').innerHTML = badge(status.services.mieru.active,
       t('dashboard.active'), t('dashboard.inactive'));
-    el('d-user-count').textContent = status.panel.userCount;
+    el('d-user-count').textContent = `${status.panel.activeUsers == null ? 'N/A' : status.panel.activeUsers}/${status.panel.userCount || 0}`;
     el('d-domain').textContent     = status.domain || '—';
 
     const cpu = status.system.cpuPercent || 0;
@@ -417,6 +424,8 @@ async function loadDashboard() {
       [t('dashboard.uptime'),       fmtUptime(status.system.uptime)],
       [t('dashboard.naivePort'),    state.config.naivePort],
       [t('dashboard.mieruPorts'),   `${state.config.mieruPortStart}–${state.config.mieruPortEnd}`],
+      ['Active IPs',                status.panel.activeIps || 0],
+      ['IP limit exceeded',         status.panel.ipLimitExceededUsers == null ? 'N/A' : status.panel.ipLimitExceededUsers],
       [t('dashboard.naiveVersion'), status.services.naive.version || '—'],
       [t('dashboard.mieruVersion'), status.services.mieru.version || '—'],
     ]);
@@ -433,19 +442,19 @@ async function loadDashboard() {
 
 async function loadUsers() {
   const tbody = el('users-tbody');
-  tbody.innerHTML = `<tr><td colspan="10" class="table-empty">${t('users.loading')}</td></tr>`;
+  tbody.innerHTML = `<tr><td colspan="12" class="table-empty">${t('users.loading')}</td></tr>`;
   try {
     state.users = await api('GET', '/api/users');
     renderUsersTable(state.users);
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="10" class="table-empty" style="color:var(--red)">${esc(err.message)}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="12" class="table-empty" style="color:var(--red)">${esc(err.message)}</td></tr>`;
   }
 }
 
 function renderUsersTable(users) {
   const tbody = el('users-tbody');
   if (!users.length) {
-    tbody.innerHTML = `<tr><td colspan="10" class="table-empty">${t('users.noUsers')}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="12" class="table-empty">${t('users.noUsers')}</td></tr>`;
     return;
   }
   tbody.innerHTML = users.map(u => {
@@ -453,6 +462,7 @@ function renderUsersTable(users) {
     const protocols = Array.isArray(u.protocols) ? u.protocols : safeParseJSON(u.protocols, []);
     const hasNaive  = protocols.includes('naive');
     const hasMieru  = protocols.includes('mieru');
+    const enabled = u.enabled !== false;
     const expBadge  = u.expiry
       ? (new Date(u.expiry) < new Date()
           ? `<span class="badge badge-red">${t('users.expired')}</span>`
@@ -467,6 +477,7 @@ function renderUsersTable(users) {
     // Bug 1 fix: use data-action + data-id instead of onclick="..."
     return `<tr>
       <td><strong>${esc(u.username)}</strong></td>
+      <td>${enabled ? '<span class="badge badge-green">enabled</span>' : '<span class="badge badge-red">disabled</span>'}</td>
       <td>${esc(u.email)}</td>
       <td>${expBadge}</td>
       <td>${hasNaive ? '<span class="badge badge-blue">✓</span>' : '<span class="badge badge-gray">—</span>'}</td>
@@ -474,9 +485,17 @@ function renderUsersTable(users) {
       <td>${fmtNum(u.usedMB)}</td>
       <td>${u.quotaMB > 0 ? fmtNum(u.quotaMB) : '∞'}</td>
       <td>${quotaStr}</td>
+      <td title="${esc(u.trackingReason || '')}">${
+        u.trackingAvailable === false
+          ? '<span class="badge badge-gray">N/A</span>'
+          : `<span class="badge ${u.activeIpCount > 0 ? 'badge-blue' : 'badge-gray'}">${u.activeIpCount || 0} / ${u.uniqueIpCount24h || 0}</span>`
+      }</td>
       <td>${fmtLastSeen(u.lastSeen)}</td>
       <td>
         <div style="display:flex;gap:4px;flex-wrap:wrap">
+          <button class="btn btn-xs ${enabled ? 'btn-warning' : 'btn-success'}" data-action="toggle-user-enabled" data-id="${u.id}" data-enabled="${enabled}">${enabled ? 'Disable' : 'Enable'}</button>
+          ${u.trackingAvailable === false ? '' : `<button class="btn btn-xs btn-ghost" data-action="reset-user-sessions" data-id="${u.id}">Reset IPs</button>`}
+          ${u.trackingAvailable === false ? '' : `<button class="btn btn-xs btn-ghost" data-action="open-ip-history" data-id="${u.id}">IP History</button>`}
           <button class="btn btn-xs btn-secondary" data-action="edit-user"   data-id="${u.id}">${t('users.edit')}</button>
           <button class="btn btn-xs btn-ghost"     data-action="open-config" data-id="${u.id}">${t('users.config')}</button>
           <button class="btn btn-xs btn-danger"    data-action="delete-user" data-id="${u.id}" data-username="${esc(u.username)}">${t('users.delete')}</button>
@@ -497,6 +516,8 @@ function openAddUser() {
   el('u-quota').value      = '0';
   el('p-naive').checked    = true;
   el('p-mieru').checked    = true;
+  const enabledEl = el('u-enabled');
+  if (enabledEl) enabledEl.checked = true;
   el('u-pass-hint').textContent = t('users.passwordHintNew');
   el('user-modal-error').classList.add('hidden');
   el('user-modal').classList.remove('hidden');
@@ -518,6 +539,8 @@ function openEditUser(id) {
   el('u-quota').value    = user.quotaMB || 0;
   el('p-naive').checked  = protocols.includes('naive');
   el('p-mieru').checked  = protocols.includes('mieru');
+  const enabledEl = el('u-enabled');
+  if (enabledEl) enabledEl.checked = user.enabled !== false;
   el('u-pass-hint').textContent = t('users.passwordHintEdit');
   el('user-modal-error').classList.add('hidden');
   el('user-modal').classList.remove('hidden');
@@ -542,6 +565,8 @@ async function saveUser() {
   if (!protocols.length)    return showUserError(t('users.protocolRequired'));
 
   const body = { email, username, expiry, protocols, quotaMB };
+  const enabledEl = el('u-enabled');
+  if (enabledEl) body.enabled = enabledEl.checked;
   if (password) body.password = password;
 
   // v1.2.5: disabled-button + spinner pattern
@@ -588,6 +613,48 @@ async function deleteUser(id, username) {
   }
 }
 
+async function toggleUserEnabled(id, currentlyEnabled) {
+  try {
+    await api('PATCH', `/api/users/${id}`, { enabled: !currentlyEnabled });
+    toast(currentlyEnabled ? 'User disabled' : 'User enabled', 'success');
+    loadUsers();
+    loadDashboard();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function resetUserSessions(id) {
+  try {
+    await api('POST', `/api/users/${id}/reset-sessions`);
+    toast('Sessions reset', 'success');
+    loadUsers();
+    loadDashboard();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+function closeIpHistoryModal() { el('ip-history-modal')?.classList.add('hidden'); }
+
+async function openIpHistory(id) {
+  const user = state.users.find(u => u.id === id);
+  if (el('ip-history-title')) el('ip-history-title').textContent = `IP History${user?.username ? `: ${user.username}` : ''}`;
+  if (el('ip-history-active')) el('ip-history-active').textContent = '...';
+  if (el('ip-history-unique')) el('ip-history-unique').textContent = '...';
+  if (el('ip-history-tbody')) el('ip-history-tbody').innerHTML = `<tr><td colspan="6" class="table-empty">Loading...</td></tr>`;
+  el('ip-history-modal')?.classList.remove('hidden');
+
+  try {
+    const data = await api('GET', `/api/users/${id}/ip-history`);
+    if (el('ip-history-active')) el('ip-history-active').textContent = data.activeIpCount ?? 0;
+    if (el('ip-history-unique')) el('ip-history-unique').textContent = data.uniqueIpCount24h ?? 0;
+    renderIpHistoryRows(el('ip-history-tbody'), data.ips || [], 6);
+  } catch (err) {
+    if (el('ip-history-tbody')) el('ip-history-tbody').innerHTML = `<tr><td colspan="6" class="table-empty">${esc(err.message)}</td></tr>`;
+  }
+}
+
 // ══════════════════════════════════════════════════════════════
 // CLIENT CONFIGS + QR CODE
 // ══════════════════════════════════════════════════════════════
@@ -596,6 +663,8 @@ function openConfigDownload(id) {
   state.selectedUserId = id;
   el('naive-link-box').classList.add('hidden');
   el('naive-link-box').textContent = '';
+  el('subscription-link-box')?.classList.add('hidden');
+  if (el('subscription-link-box')) el('subscription-link-box').textContent = '';
   el('qr-container').classList.add('hidden');
   el('config-modal').classList.remove('hidden');
   // P3 (selectable mieru port): prefill the port selector from server config.
@@ -614,6 +683,7 @@ function openConfigDownload(id) {
   // P3: no password prompt — the server uses the user's stored password.
   // Auto-load the naive link + QR right away.
   loadNaiveLink();
+  loadSubscriptionLink();
 }
 
 // P3: build a `?port=` query string from the modal's port selector, validating
@@ -640,7 +710,7 @@ async function loadNaiveLink() {
   try {
     const data = await api('GET',
       `/api/users/${state.selectedUserId}/config/naive`);
-    el('naive-link-box').textContent = data.link;
+    el('naive-link-box').textContent = `Raw Naive link: ${data.link}`;
     el('naive-link-box').classList.remove('hidden');
     generateQR(data.link);
   } catch (err) { toast(err.message, 'error'); }
@@ -651,7 +721,7 @@ async function downloadNaiveLink() {
     const data = await api('GET',
       `/api/users/${state.selectedUserId}/config/naive`);
 
-    el('naive-link-box').textContent = data.link;
+    el('naive-link-box').textContent = `Raw Naive link: ${data.link}`;
     el('naive-link-box').classList.remove('hidden');
     copyToClipboard(data.link);
     toast(t('config.naiveCopied'), 'success');
@@ -767,7 +837,97 @@ async function loadSettings() {
         : (cascadeMieruPassEl.placeholder || 'password');
     }
     document.getElementById('about-version').textContent = `v${cfg.version || '1.2.4'}`;
+    await loadNodeApiSettings();
   } catch {}
+}
+
+function loadSubscriptionLink() {
+  const user = state.users.find(u => u.id === state.selectedUserId);
+  const box = el('subscription-link-box');
+  if (!box) return;
+  if (!user || !user.subscriptionUrl) {
+    box.textContent = 'Node subscription: unavailable (subscriptionToken missing)';
+    box.classList.remove('hidden');
+    return;
+  }
+  const url = `${user.subscriptionUrl}?format=json`;
+  box.textContent = `Node subscription: ${url}`;
+  box.classList.remove('hidden');
+}
+
+async function loadNodeApiSettings() {
+  try {
+    const data = await api('GET', '/api/node-api/settings');
+    const s = data.settings || {};
+    const v = data.version || {};
+    if (el('node-api-key')) el('node-api-key').value = data.nodeApiKey || '';
+    if (el('node-api-status')) el('node-api-status').innerHTML = badge(data.status === 'ready', 'ready', 'locked');
+    if (el('node-api-domain')) el('node-api-domain').textContent = s.domain || '—';
+    if (el('node-api-server-ip')) el('node-api-server-ip').textContent = s.serverIp || '—';
+    if (el('node-api-version')) el('node-api-version').textContent = `${v.nodeAgent || 'vetka-node-agent'} ${v.version || ''}`.trim();
+    if (el('node-api-allowed-ips')) el('node-api-allowed-ips').value = (s.backendAllowedIps || []).join('\n');
+    if (el('node-api-session-ttl')) el('node-api-session-ttl').value = s.sessionTtlMinutes || 10;
+    if (el('node-api-auth-audit-log')) el('node-api-auth-audit-log').value = s.authAuditLogPath || '';
+    if (el('node-api-max-ips')) el('node-api-max-ips').value = s.maxUniqueIpsPerUser || 5;
+    if (el('node-api-enforce-ip-limit')) el('node-api-enforce-ip-limit').checked = s.enforceIpLimit === true;
+    if (el('node-api-allow-any-ip')) el('node-api-allow-any-ip').checked = s.allowAnyBackendIp === true;
+    if (el('node-api-subscription-base-url')) el('node-api-subscription-base-url').value = s.subscriptionBaseUrl || '';
+  } catch (err) {
+    showMsg('node-api-msg', err.message, false);
+  }
+}
+
+async function copyNodeApiKey() {
+  const key = el('node-api-key')?.value || '';
+  if (!key) return showMsg('node-api-msg', 'nodeApiKey is empty', false);
+  try {
+    await navigator.clipboard.writeText(key);
+    showMsg('node-api-msg', 'nodeApiKey copied', true);
+  } catch {
+    showMsg('node-api-msg', 'Clipboard is unavailable', false);
+  }
+}
+
+async function saveNodeApiSettings() {
+  const backendAllowedIps = (el('node-api-allowed-ips')?.value || '')
+    .split(/\r?\n|,/)
+    .map(v => v.trim())
+    .filter(Boolean);
+  const body = {
+    backendAllowedIps,
+    allowAnyBackendIp: el('node-api-allow-any-ip')?.checked === true,
+    sessionTtlMinutes: parseInt(el('node-api-session-ttl')?.value, 10) || 10,
+    authAuditLogPath: el('node-api-auth-audit-log')?.value?.trim() || '',
+    maxUniqueIpsPerUser: parseInt(el('node-api-max-ips')?.value, 10) || 5,
+    enforceIpLimit: el('node-api-enforce-ip-limit')?.checked === true,
+    subscriptionBaseUrl: el('node-api-subscription-base-url')?.value?.trim() || ''
+  };
+  const btn = document.querySelector('[data-action="save-node-api-settings"]');
+  setBtnBusy(btn, true);
+  try {
+    await api('PATCH', '/api/node-api/settings', body);
+    showMsg('node-api-msg', 'Node API settings saved', true);
+    await loadNodeApiSettings();
+  } catch (err) {
+    showMsg('node-api-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+async function regenerateNodeApiKey() {
+  if (!confirm('Regenerate nodeApiKey? Existing Backend clients will stop working until updated.')) return;
+  const btn = document.querySelector('[data-action="regenerate-node-api-key"]');
+  setBtnBusy(btn, true);
+  try {
+    const res = await api('POST', '/api/node-api/regenerate-key');
+    if (el('node-api-key')) el('node-api-key').value = res.nodeApiKey || '';
+    showMsg('node-api-msg', 'New nodeApiKey generated. Copy it now.', true);
+  } catch (err) {
+    showMsg('node-api-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
+  }
 }
 
 async function changeNaivePort() {
@@ -1026,9 +1186,11 @@ async function loadMonitoring() { refreshStats(); }
 
 async function refreshStats() {
   try {
-    const [status, stats] = await Promise.all([
+    const [status, stats, nodeSessions, userSessions] = await Promise.all([
       api('GET', '/api/status'),
       api('GET', '/api/stats/users'),
+      api('GET', '/api/node/sessions'),
+      api('GET', '/api/users/sessions'),
     ]);
 
     el('m-cpu').textContent    = `${status.system.cpuPercent}%`;
@@ -1038,9 +1200,103 @@ async function refreshStats() {
     el('m-uptime').textContent = fmtUptime(status.system.uptime);
 
     renderTrafficTable(stats);
+    renderPerUserSessions(userSessions);
+    renderPerUserIpHistory(userSessions);
+    renderNodeSessions(nodeSessions);
   } catch (err) {
     console.error('Monitoring error:', err);
   }
+}
+
+function renderIpHistoryRows(tbody, ips, colspan) {
+  if (!tbody) return;
+  if (!ips.length) {
+    tbody.innerHTML = `<tr><td colspan="${colspan}" class="table-empty">No IP history in the selected window</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = ips.map(ip => `<tr>
+    <td><strong>${esc(ip.ip || ip.remoteIp || '')}</strong></td>
+    <td>${ip.active ? '<span class="badge badge-green">Active</span>' : '<span class="badge badge-gray">Inactive</span>'}</td>
+    <td>${fmtLastSeen(ip.firstSeen)}</td>
+    <td>${fmtLastSeen(ip.lastSeen)}</td>
+    <td>${fmtNum(ip.requestCount || 0)}</td>
+    <td>${esc((ip.hosts || []).slice(0, 6).join(', '))}</td>
+  </tr>`).join('');
+}
+
+function renderPerUserSessions(data) {
+  const tbody = el('user-sessions-tbody');
+  if (!tbody) return;
+  if (el('user-active-ip-count')) el('user-active-ip-count').textContent = data?.uniqueActiveIps ?? 'вЂ”';
+  if (data?.trackingAvailable === false) {
+    tbody.innerHTML = `<tr><td colspan="5" class="table-empty">${esc(data.reason || 'auth audit log not configured')}</td></tr>`;
+    return;
+  }
+  const users = data?.users || [];
+  const rows = [];
+  for (const user of users) {
+    const sessions = user.sessions || [];
+    if (!sessions.length) continue;
+    rows.push(...sessions.map((s, idx) => `<tr>
+      <td>${idx === 0 ? `<strong>${esc(user.username)}</strong>` : ''}</td>
+      <td><strong>${esc(s.ip || s.remoteIp || '')}</strong></td>
+      <td>${fmtLastSeen(s.lastSeen)}</td>
+      <td>${fmtNum(s.requestCount || 0)}</td>
+      <td>${esc((s.hosts || []).slice(0, 6).join(', '))}</td>
+    </tr>`));
+  }
+  tbody.innerHTML = rows.length
+    ? rows.join('')
+    : `<tr><td colspan="5" class="table-empty">No recent per-user sessions</td></tr>`;
+}
+
+function renderPerUserIpHistory(data) {
+  const tbody = el('user-ip-history-tbody');
+  if (!tbody) return;
+  if (el('user-history-ip-count')) el('user-history-ip-count').textContent = data?.uniqueIpCount24h ?? 'вЂ”';
+  if (data?.trackingAvailable === false) {
+    tbody.innerHTML = `<tr><td colspan="8" class="table-empty">${esc(data.reason || 'auth audit log not configured')}</td></tr>`;
+    return;
+  }
+  const users = data?.users || [];
+  const rows = [];
+  for (const user of users) {
+    const ips = user.ips || [];
+    if (!ips.length) continue;
+    rows.push(...ips.map((ip, idx) => `<tr>
+      <td>${idx === 0 ? `<strong>${esc(user.username)}</strong>` : ''}</td>
+      <td>${idx === 0 ? fmtNum(user.activeIpCount || 0) : ''}</td>
+      <td>${idx === 0 ? fmtNum(user.uniqueIpCount24h || 0) : ''}</td>
+      <td><strong>${esc(ip.ip || ip.remoteIp || '')}</strong></td>
+      <td>${ip.active ? '<span class="badge badge-green">Active</span>' : '<span class="badge badge-gray">Inactive</span>'}</td>
+      <td>${fmtLastSeen(ip.lastSeen)}</td>
+      <td>${fmtNum(ip.requestCount || 0)}</td>
+      <td>${esc((ip.hosts || []).slice(0, 6).join(', '))}</td>
+    </tr>`));
+  }
+  tbody.innerHTML = rows.length
+    ? rows.join('')
+    : `<tr><td colspan="8" class="table-empty">No per-user IP history</td></tr>`;
+}
+
+
+function renderNodeSessions(data) {
+  const tbody = el('node-sessions-tbody');
+  if (!tbody) return;
+  const sessions = data?.sessions || [];
+  if (el('node-active-ip-count')) el('node-active-ip-count').textContent = data?.uniqueActiveIps ?? '—';
+  if (!sessions.length) {
+    tbody.innerHTML = `<tr><td colspan="6" class="table-empty">No recent node IPs</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = sessions.map(s => `<tr>
+    <td><strong>${esc(s.remoteIp)}</strong></td>
+    <td>${esc(s.protocol || 'naive')}</td>
+    <td>${esc(s.username || 'unknown')}</td>
+    <td>${fmtLastSeen(s.lastSeen)}</td>
+    <td>${fmtNum(s.requestCount || 0)}</td>
+    <td>${esc((s.hosts || []).slice(0, 4).join(', '))}</td>
+  </tr>`).join('');
 }
 
 function renderTrafficTable(stats) {

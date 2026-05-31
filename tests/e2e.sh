@@ -153,11 +153,21 @@ if [[ -x "$CADDY_BIN" ]]; then
   else
     pass "Caddyfile: no bare 'basic_auth' without arguments"
   fi
-  # Bug 28: no  tls <email>  inside site block
+  # Vetka node-agent: site block intentionally uses explicit tls <email>.
   if grep -qP '^\s+tls\s+\S+@' "$CADDY_FILE" 2>/dev/null; then
-    fail "Caddyfile has redundant 'tls <email>' inside site block (Bug 28)"
+    pass "Caddyfile: explicit 'tls <email>' directive present"
   else
-    pass "Caddyfile: no redundant 'tls' directive in site block"
+    fail "Caddyfile missing explicit 'tls <email>' directive"
+  fi
+  if grep -q 'protocols h1 h2' "$CADDY_FILE" 2>/dev/null; then
+    pass "Caddyfile: HTTP/3/QUIC disabled via h1/h2 protocols"
+  else
+    fail "Caddyfile missing 'protocols h1 h2'"
+  fi
+  if stat -c '%U:%G %a' "$CADDY_FILE" 2>/dev/null | grep -q '^root:caddy 640$'; then
+    pass "Caddyfile permissions are root:caddy 640"
+  else
+    fail "Caddyfile permissions are not root:caddy 640"
   fi
   # Bug 30: order directive present
   if grep -q 'order forward_proxy before file_server' "$CADDY_FILE" 2>/dev/null; then
@@ -291,6 +301,80 @@ else
         pass "Caddyfile: user line is 'basic_auth $TEST_USER <pass>' (Bug 23)"
       else
         fail "Caddyfile: expected 'basic_auth $TEST_USER ...' not found (Bug 23)"
+      fi
+
+      NODE_API_KEY=$(python3 -c "import json; print(json.load(open('$PANEL_CONFIG')).get('nodeApiKey',''))" 2>/dev/null || true)
+      if [[ -n "$NODE_API_KEY" ]]; then
+        internal_health=$(curl -sf -H "Authorization: Bearer $NODE_API_KEY" "$PANEL_URL/internal/health" 2>/dev/null || true)
+        if echo "$internal_health" | grep -q '"ok":true'; then
+          pass "Internal API health works with Bearer NODE_API_KEY"
+        else
+          fail "Internal API health failed"
+        fi
+        internal_explorer=$(curl -s -H "Authorization: Bearer $NODE_API_KEY" "$PANEL_URL/internal/sessions/explorer" 2>/dev/null || true)
+        if echo "$internal_explorer" | grep -q '"ok":true' && echo "$internal_explorer" | grep -q '"summary"'; then
+          pass "Internal sessions explorer returns summary"
+        else
+          fail "Internal sessions explorer failed"
+        fi
+        internal_details=$(curl -s -H "Authorization: Bearer $NODE_API_KEY" "$PANEL_URL/internal/users/$USER_ID/details" 2>/dev/null || true)
+        if echo "$internal_details" | grep -q '"ok":true' && echo "$internal_details" | grep -q '"ipHistory"'; then
+          pass "Internal user details returns ipHistory"
+        else
+          fail "Internal user details failed"
+        fi
+        internal_ip=$(curl -s -H "Authorization: Bearer $NODE_API_KEY" "$PANEL_URL/internal/ip/127.0.0.1" 2>/dev/null || true)
+        if echo "$internal_ip" | grep -q '"ok":true' && echo "$internal_ip" | grep -q '"ip":"127.0.0.1"'; then
+          pass "Internal IP lookup works"
+        else
+          fail "Internal IP lookup failed"
+        fi
+        internal_logs=$(curl -s -H "Authorization: Bearer $NODE_API_KEY" "$PANEL_URL/internal/logs/status" 2>/dev/null || true)
+        if echo "$internal_logs" | grep -q '"ok":true' && echo "$internal_logs" | grep -q '"authAuditLogRecords"'; then
+          pass "Internal logs status works"
+        else
+          fail "Internal logs status failed"
+        fi
+      else
+        fail "nodeApiKey missing from config.json"
+      fi
+
+      users_sessions=$(curl -s -b "$COOKIE_JAR" "$PANEL_URL/api/users/sessions" 2>/dev/null || true)
+      if echo "$users_sessions" | grep -q 'User not found'; then
+        fail "/api/users/sessions was captured by /api/users/:id"
+      elif echo "$users_sessions" | grep -q '"ok":true'; then
+        pass "/api/users/sessions returns sessions payload"
+      else
+        fail "/api/users/sessions did not return ok"
+      fi
+
+      user_detail=$(curl -s -b "$COOKIE_JAR" "$PANEL_URL/api/users/$USER_ID" 2>/dev/null || true)
+      if echo "$user_detail" | grep -q "\"id\":\"$USER_ID\""; then
+        pass "/api/users/:id returns real user"
+      else
+        fail "/api/users/:id failed for real user"
+      fi
+
+      users_list=$(curl -s -b "$COOKIE_JAR" "$PANEL_URL/api/users" 2>/dev/null || true)
+      if echo "$users_list" | grep -q '"uniqueIpCount24h"'; then
+        pass "/api/users includes uniqueIpCount24h"
+      else
+        fail "/api/users missing uniqueIpCount24h"
+      fi
+
+      ip_history=$(curl -s -b "$COOKIE_JAR" "$PANEL_URL/api/users/$USER_ID/ip-history" 2>/dev/null || true)
+      if echo "$ip_history" | grep -q '"ok":true'; then
+        pass "/api/users/:id/ip-history returns ok"
+      else
+        fail "/api/users/:id/ip-history did not return ok"
+      fi
+
+      reset_sessions=$(curl -s -b "$COOKIE_JAR" -X POST "$PANEL_URL/api/users/$USER_ID/reset-sessions" 2>/dev/null || true)
+      ip_history_after_reset=$(curl -s -b "$COOKIE_JAR" "$PANEL_URL/api/users/$USER_ID/ip-history" 2>/dev/null || true)
+      if echo "$reset_sessions" | grep -q '"ok":true' && echo "$ip_history_after_reset" | grep -q '"ok":true'; then
+        pass "Reset IPs keeps /api/users/:id/ip-history healthy"
+      else
+        fail "Reset IPs broke /api/users/:id/ip-history"
       fi
 
       # Bug 34: placeholder should be gone once real user exists

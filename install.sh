@@ -58,11 +58,17 @@ NAIVE_BIN="/usr/local/bin/naive"        # may still exist from v1.2.x; will be r
 NAIVE_CONFIG_DIR="/etc/naive"
 
 CURRENT_VERSION="1.2.6"
-REPO_URL="https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX"
+PANEL_REPO_URL="${PANEL_REPO_URL:-https://github.com/Daniil-GR/panel_node_agent}"
+PANEL_REPO_BRANCH="${PANEL_REPO_BRANCH:-main}"
+REPO_URL="$PANEL_REPO_URL"
 # Bug 1: direct download URL for caddy-forwardproxy-naive (amd64 only)
 CADDY_NAIVE_RELEASES="https://api.github.com/repos/klzgrad/forwardproxy/releases/latest"
 CADDY_NAIVE_FALLBACK_URL="https://github.com/klzgrad/forwardproxy/releases/download/v2.10.0-naive/caddy-forwardproxy-naive.tar.xz"
 MIERU_RELEASES="https://api.github.com/repos/enfein/mieru/releases/latest"
+CADDY_MODE="${CADDY_MODE:-vetka}"
+VETKA_CADDY_REPO="${VETKA_CADDY_REPO:-https://github.com/Daniil-GR/caddy-forwardproxy-vetka.git}"
+VETKA_CADDY_BRANCH="${VETKA_CADDY_BRANCH:-naive}"
+VETKA_CADDY_BUILD_DIR="${VETKA_CADDY_BUILD_DIR:-/opt/caddy-forwardproxy-vetka}"
 
 # ── Flags ─────────────────────────────────────────────────────────────────────
 NON_INTERACTIVE=false
@@ -250,11 +256,92 @@ install_nodejs() {
   fi
 }
 
-# ── Bug 1: Install caddy-forwardproxy-naive (amd64 only) ──────────────────────
-# Downloads from https://github.com/klzgrad/forwardproxy/releases/latest
-# Validates binary and sets file capabilities for binding privileged ports.
-install_caddy_naive() {
-  log_step "$(t 'Установка caddy-forwardproxy-naive' 'Installing caddy-forwardproxy-naive')"
+# ── Caddy-forwardproxy-naive binary ───────────────────────────────────────────
+ensure_xcaddy() {
+  if ! command -v git &>/dev/null || ! command -v go &>/dev/null || ! command -v strings &>/dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git golang-go build-essential ca-certificates binutils
+  fi
+  if ! command -v xcaddy &>/dev/null; then
+    GOBIN=/usr/local/bin go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+  fi
+}
+
+verify_vetka_caddy() {
+  local caddy_bin="${1:-$CADDY_BIN}"
+  local test_cfg; test_cfg=$(mktemp /tmp/vetka-caddy-XXXXXX.Caddyfile)
+  local adapt_err; adapt_err=$(mktemp /tmp/vetka-caddy-adapt-XXXXXX.err)
+  cat > "$test_cfg" <<'CADDYTEST'
+:0 {
+  forward_proxy {
+    auth_audit_log /tmp/auth-audit.log
+    traffic_audit_log /tmp/traffic-audit.log
+  }
+}
+CADDYTEST
+  local adapt_out=""
+  if ! adapt_out=$("$caddy_bin" adapt --config "$test_cfg" --adapter caddyfile 2>"$adapt_err"); then
+    log_error "Vetka Caddy adapt failed:"
+    cat "$adapt_err" >&2 || true
+    echo "$adapt_out" >&2
+    rm -f "$test_cfg" "$adapt_err"
+    return 1
+  fi
+  local ok=true
+  if echo "$adapt_out" | grep -q '"auth_audit_log"'; then
+    log_info "Vetka Caddy supports auth_audit_log ✓"
+  else
+    log_error "Vetka Caddy adapt output does not contain auth_audit_log"
+    ok=false
+  fi
+  if echo "$adapt_out" | grep -q '"traffic_audit_log"'; then
+    log_info "Vetka Caddy supports traffic_audit_log ✓"
+  else
+    log_error "Vetka Caddy adapt output does not contain traffic_audit_log"
+    ok=false
+  fi
+  if $ok; then
+    rm -f "$test_cfg" "$adapt_err"
+    return 0
+  fi
+  log_error "adapt stderr:"
+  cat "$adapt_err" >&2 || true
+  log_error "adapt stdout:"
+  echo "$adapt_out" >&2
+  strings "$caddy_bin" | grep -q 'auth_audit_log' || log_error "Binary strings do not contain auth_audit_log."
+  strings "$caddy_bin" | grep -q 'traffic_audit_log' || log_error "Binary strings do not contain traffic_audit_log."
+  rm -f "$test_cfg" "$adapt_err"
+  return 1
+}
+
+install_vetka_caddy_naive() {
+  log_step "$(t 'Установка Vetka patched caddy-forwardproxy' 'Installing Vetka patched caddy-forwardproxy')"
+  ensure_xcaddy
+  if [[ -d "$VETKA_CADDY_BUILD_DIR/.git" ]]; then
+    git -C "$VETKA_CADDY_BUILD_DIR" fetch origin "$VETKA_CADDY_BRANCH"
+    git -C "$VETKA_CADDY_BUILD_DIR" checkout "$VETKA_CADDY_BRANCH"
+    git -C "$VETKA_CADDY_BUILD_DIR" reset --hard "origin/$VETKA_CADDY_BRANCH"
+  else
+    rm -rf "$VETKA_CADDY_BUILD_DIR"
+    git clone --depth 1 --branch "$VETKA_CADDY_BRANCH" "$VETKA_CADDY_REPO" "$VETKA_CADDY_BUILD_DIR"
+  fi
+
+  local tmp_dir; tmp_dir=$(mktemp -d)
+  xcaddy build --output "$tmp_dir/caddy-naive" \
+    --with "github.com/caddyserver/forwardproxy@master=${VETKA_CADDY_BUILD_DIR}"
+  verify_vetka_caddy "$tmp_dir/caddy-naive" || die "Vetka Caddy build does not support auth_audit_log"
+  install -m 755 "$tmp_dir/caddy-naive" "$CADDY_BIN"
+  rm -rf "$tmp_dir"
+
+  if command -v setcap &>/dev/null; then
+    setcap 'cap_net_bind_service=+ep' "$CADDY_BIN" 2>/dev/null || true
+  fi
+  CADDY_VERSION=$("$CADDY_BIN" version 2>/dev/null | head -1 || echo "vetka-${VETKA_CADDY_BRANCH}")
+  log_info "Vetka caddy-naive installed -> $CADDY_BIN ($CADDY_VERSION) ✓"
+  export CADDY_VERSION
+}
+
+install_upstream_caddy_naive() {
+  log_step "$(t 'Установка upstream caddy-forwardproxy-naive' 'Installing upstream caddy-forwardproxy-naive')"
 
   local tmp_dir; tmp_dir=$(mktemp -d)
   local archive_path="${tmp_dir}/caddy-forwardproxy-naive.tar.xz"
@@ -331,6 +418,14 @@ install_caddy_naive() {
   fi
 }
 
+install_caddy_naive() {
+  case "${CADDY_MODE:-vetka}" in
+    vetka) install_vetka_caddy_naive ;;
+    upstream) install_upstream_caddy_naive ;;
+    *) die "Unsupported CADDY_MODE=${CADDY_MODE}. Use vetka or upstream." ;;
+  esac
+}
+
 # ── Mieru (mita) via .deb ─────────────────────────────────────────────────────
 install_mieru() {
   log_step "$(t 'Установка Mieru (mita)' 'Installing Mieru (mita)')"
@@ -355,8 +450,22 @@ install_mieru() {
   log_info "$(t "Загрузка: $asset_url" "Downloading: $asset_url")"
   wget -q --show-progress -O "$deb_file" "$asset_url" || \
     die "$(t 'Ошибка загрузки Mieru .deb' 'Failed to download Mieru .deb')"
-  dpkg -i "$deb_file" 2>/dev/null || apt-get install -f -y
+  local policy_rc_created=false
+  if [[ ! -e /usr/sbin/policy-rc.d ]]; then
+    cat > /usr/sbin/policy-rc.d <<'POLICYRC'
+#!/bin/sh
+exit 101
+POLICYRC
+    chmod +x /usr/sbin/policy-rc.d
+    policy_rc_created=true
+  fi
+  local install_ok=true
+  dpkg -i "$deb_file" 2>/dev/null || apt-get install -f -y || install_ok=false
+  if $policy_rc_created; then rm -f /usr/sbin/policy-rc.d; fi
+  $install_ok || die "$(t 'Ошибка установки Mieru .deb' 'Failed to install Mieru .deb')"
   rm -f "$deb_file"
+  systemctl stop mita 2>/dev/null || true
+  systemctl reset-failed mita 2>/dev/null || true
   MIERU_VERSION=$(mita version 2>/dev/null | grep -oP 'v[\d.]+' | head -1 || echo "$tag")
   log_info "mita $(t 'установлен' 'installed') ($MIERU_VERSION) ✓"
 }
@@ -584,6 +693,7 @@ write_caddyfile() {
   # Bug 26: render Caddyfile via the shared caddyTemplate.js module
   local template_js="${PANEL_DIR}/server/caddyTemplate.js"
   local caddyfile_content
+  local panel_listen_port="${PANEL_LISTEN_PORT:-3000}"
 
   # Bug 46: log template errors to INSTALL_LOG instead of swallowing them
   if [[ -f "$template_js" ]] && command -v node &>/dev/null; then
@@ -594,10 +704,13 @@ write_caddyfile() {
         adminEmail:  '${ADMIN_EMAIL}',
         domain:      '${DOMAIN}',
         naivePort:   ${NAIVE_PORT},
+        panelPort:   ${panel_listen_port},
         fakeSiteDir: '${FAKE_SITE_DIR}',
         probeSecret: '${PROBE_SECRET}',
         probeMode:   '${PROBE_MODE:-bare}',
-        logFile:     '/var/log/caddy-naive/access.log'
+        logFile:     '/var/log/caddy-naive/access.log',
+        authAuditLogPath: '/var/log/caddy-naive/auth-audit.log',
+        trafficAuditLogPath: '/var/log/caddy-naive/traffic-audit.log'
       };
       process.stdout.write(t.render(cfg, users));
     " 2>>"$INSTALL_LOG") || true
@@ -662,9 +775,13 @@ write_caddyfile() {
 }
 
 :${NAIVE_PORT}, ${DOMAIN} {
-  # Bug 83: match the known-good reference server (":<port>, <domain>" listener +
-  # explicit tls + no route{} wrapper).
+  # Bug 83: match the known-good reference server: listen on port and domain,
+  # explicit tls directive, no route wrapper.
   tls ${ADMIN_EMAIL}
+
+  handle /sub/* {
+    reverse_proxy 127.0.0.1:${panel_listen_port}
+  }
 
   forward_proxy {
 ${auth_lines}
@@ -672,6 +789,9 @@ ${auth_lines}
     hide_via"
     [[ -n "$probe_line" ]] && caddyfile_content+="
 ${probe_line}"
+    caddyfile_content+="
+    auth_audit_log /var/log/caddy-naive/auth-audit.log
+    traffic_audit_log /var/log/caddy-naive/traffic-audit.log"
     caddyfile_content+="
   }
 
@@ -685,6 +805,9 @@ ${probe_line}"
   local tmp_file="${CADDY_FILE}.new"
   printf '%s\n' "$caddyfile_content" > "$tmp_file"
   mv "$tmp_file" "$CADDY_FILE"
+  chown root:caddy "$CADDY_CONFIG_DIR" 2>/dev/null || true
+  chmod 750 "$CADDY_CONFIG_DIR" 2>/dev/null || true
+  chown root:caddy "$CADDY_FILE" 2>/dev/null || true
   chmod 640 "$CADDY_FILE"
 
   # Bug 60: format Caddyfile with caddy fmt --overwrite to ensure canonical style
@@ -706,7 +829,8 @@ ${probe_line}"
 
   # Store probe_secret in caddy config dir for panel to read
   echo "$PROBE_SECRET" > "${CADDY_CONFIG_DIR}/probe_secret"
-  chmod 600 "${CADDY_CONFIG_DIR}/probe_secret"
+  chown root:caddy "${CADDY_CONFIG_DIR}/probe_secret" 2>/dev/null || true
+  chmod 640 "${CADDY_CONFIG_DIR}/probe_secret"
 }
 
 # ── Write caddy-naive.service ───────────────────────────────────────────────
@@ -879,17 +1003,25 @@ install_panel() {
   fi
 
   if [[ -n "$src" ]]; then
+    find "$PANEL_DIR" -mindepth 1 -maxdepth 1 ! -name node_modules -exec rm -rf {} + 2>/dev/null || true
     cp -r "$src/"* "$PANEL_DIR/"
     log_info "$(t "Файлы панели скопированы из $src ✓" "Panel files copied from $src ✓")"
   else
     log_warn "$(t 'Локальные исходники не найдены — клонирование из репозитория...' \
                'Local panel source not found — cloning from repo...')"
-    git clone --depth 1 "$REPO_URL" /tmp/panel-src 2>/dev/null || \
+    rm -rf /tmp/panel-src
+    git clone --depth 1 --branch "$PANEL_REPO_BRANCH" "$PANEL_REPO_URL" /tmp/panel-src 2>/dev/null || \
       die "$(t 'Не удалось клонировать репозиторий' 'Failed to clone panel source')"
+    find "$PANEL_DIR" -mindepth 1 -maxdepth 1 ! -name node_modules -exec rm -rf {} + 2>/dev/null || true
+    log_info "Fetched latest panel from $PANEL_REPO_URL"
     cp -r /tmp/panel-src/panel/* "$PANEL_DIR/"
     rm -rf /tmp/panel-src
   fi
   ( cd "$PANEL_DIR" && npm install --production --silent )
+  grep -q "internalRouter" "$PANEL_DIR/server/index.js" || die "Installed stale panel/server/index.js: internalRouter not found"
+  grep -q "ip-history" "$PANEL_DIR/server/index.js" || die "Installed stale panel: ip-history endpoint not found"
+  grep -q "trafficAuditLogPath" "$PANEL_DIR/server/index.js" || die "Installed stale panel: trafficAuditLogPath not found"
+  grep -q "uniqueIpCount24h" "$PANEL_DIR/server/index.js" || die "Installed stale panel: uniqueIpCount24h not found"
   log_info "$(t 'npm зависимости установлены ✓' 'npm dependencies installed ✓')"
 }
 
@@ -921,6 +1053,8 @@ write_config_json() {
     bcrypt_hash=$(htpasswd -bnBC 12 "" "$ADMIN_PASS" 2>/dev/null | tr -d ':\n' | sed 's/^[^$]*//')
   fi
   [[ -z "$bcrypt_hash" ]] && die "$(t 'Не удалось создать bcrypt-хеш пароля' 'Failed to generate bcrypt password hash')"
+  local node_api_key
+  node_api_key=$(openssl rand -hex 32)
 
   python3 - <<PYCFG
 import json
@@ -945,6 +1079,16 @@ data = {
     "fakeSiteUrl":     "$FAKE_SITE_URL",
     "probeSecret":     "$PROBE_SECRET",
     "probeMode":       "${PROBE_MODE:-bare}",
+    "nodeApiKey":      "$node_api_key",
+    "backendAllowedIps": ["127.0.0.1"],
+    "allowAnyBackendIp": False,
+    "sessionTtlMinutes": 10,
+    "authAuditLogPath": "/var/log/caddy-naive/auth-audit.log",
+    "trafficAuditLogPath": "/var/log/caddy-naive/traffic-audit.log",
+    "ipHistoryTtlHours": 24,
+    "maxUniqueIpsPerUser": 5,
+    "enforceIpLimit":  False,
+    "subscriptionBaseUrl": "",
     "mitaStateFile":   "$MITA_STATE_FILE",
     "trafficPattern":  "NOOP",
     "mtu":             1400,
@@ -1007,6 +1151,12 @@ start_services() {
   chown -R caddy:caddy /var/log/caddy-naive /var/lib/caddy
   chmod 755 /var/log/caddy-naive
   chmod 700 /var/lib/caddy
+  touch /var/log/caddy-naive/auth-audit.log
+  touch /var/log/caddy-naive/traffic-audit.log
+  chown caddy:caddy /var/log/caddy-naive/auth-audit.log
+  chown caddy:caddy /var/log/caddy-naive/traffic-audit.log
+  chmod 600 /var/log/caddy-naive/auth-audit.log
+  chmod 600 /var/log/caddy-naive/traffic-audit.log
 
   # ── 4. Caddy binary + config permissions ─────────────────────────────────────
   # Bug 55: chmod 755 (not 750) so any user can run caddy-naive validate
@@ -1097,6 +1247,8 @@ except Exception:
                    'mita failed to start — journalctl -u mita -n 30 / mita status')"
     fi
   else
+    systemctl stop mita 2>/dev/null || true
+    systemctl reset-failed mita 2>/dev/null || true
     log_info "$(t 'mita: нет пользователей — сервис запустится автоматически после добавления первого пользователя' \
                'mita: no users yet — service will start automatically after first user is added via panel')"
   fi
