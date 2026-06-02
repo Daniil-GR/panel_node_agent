@@ -211,7 +211,19 @@ assert "caddy-naive.service active"          "systemctl is-active caddy-naive"
 assert "caddy-naive runs as user 'caddy' (Bug 37)" \
        "systemctl show caddy-naive -p User | grep -q 'User=caddy'"
 assert "mita.service enabled (Bug 64)"       "systemctl is-enabled mita"
-assert "mita.service not active (no users yet)" "! systemctl is-active --quiet mita"
+if python3 - "$MITA_STATE_FILE" <<'PY' 2>/dev/null
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    data = {}
+raise SystemExit(0 if len(data.get("users", [])) > 0 else 1)
+PY
+then
+  assert "mita.service active with configured users" "systemctl is-active --quiet mita"
+else
+  assert "mita idle OK, no Mieru users configured" "! systemctl is-active --quiet mita"
+fi
 assert "Panel process running (PM2)"         "pm2 list 2>/dev/null | grep -q panel-naive-mieru"
 assert "Panel responds on :3000"             "curl -sf '$PANEL_URL/' -o /dev/null"
 assert "config.json present"                 "[[ -f '$PANEL_CONFIG' ]]"

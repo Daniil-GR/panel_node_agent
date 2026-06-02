@@ -823,6 +823,17 @@ update_caddy_naive() {
   esac
 }
 
+has_mieru_users() {
+  python3 - "$MITA_STATE_FILE" <<'PY' 2>/dev/null
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    data = {}
+raise SystemExit(0 if len(data.get("users", [])) > 0 else 1)
+PY
+}
+
 update_mieru() {
   log_step "Checking Mieru update"
   detect_arch
@@ -864,7 +875,7 @@ POLICYRC
   if $policy_rc_created; then rm -f /usr/sbin/policy-rc.d; fi
   $install_ok || { log_warn "Mieru package install failed"; rm -f "$deb"; return; }
   rm -f "$deb"
-  if python3 -c "import json; d=json.load(open('$MITA_STATE_FILE')); raise SystemExit(0 if len(d.get('users', [])) > 0 else 1)" 2>/dev/null; then
+  if has_mieru_users; then
     systemctl start mita 2>/dev/null || true
   else
     systemctl stop mita 2>/dev/null || true
@@ -975,7 +986,13 @@ smoke_test() {
 
   # v1.2.3: check caddy-naive (not legacy naive)
   check_svc caddy-naive
-  check_svc mita
+  if systemctl is-active --quiet mita; then
+    echo -e "  ${GREEN}✓${NC} mita active"; (( pass++ ))
+  elif has_mieru_users; then
+    echo -e "  ${RED}✗${NC} mita INACTIVE"; (( fail++ ))
+  else
+    echo -e "  ${GREEN}✓${NC} mita idle OK, no Mieru users configured"; (( pass++ ))
+  fi
 
   # caddy-naive version check
   if timeout 5 "$CADDY_BIN" version &>/dev/null 2>&1 || \

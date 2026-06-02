@@ -9,6 +9,17 @@ die() { echo "[ERROR] $*" >&2; exit 1; }
 
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
 
+usage() {
+  cat <<'EOF'
+Usage: static-site.sh {status|deploy|rollback}
+
+Commands:
+  status                         Show managed static site state
+  deploy [--url URL] [URL]        Deploy only the managed static site
+  rollback                       Switch dist symlink to previous release
+EOF
+}
+
 cfg() {
   local key="$1"
   python3 - "$PANEL_CONFIG" "$key" <<'PY'
@@ -57,6 +68,35 @@ site_base() {
 
 state_file() {
   echo "$(site_base)/.vetka-static-site.json"
+}
+
+set_static_site_source() {
+  local source_url="$1"
+  python3 - "$PANEL_CONFIG" "$source_url" <<'PY'
+import json, os, sys
+path, source_url = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+site = data.get("staticSite")
+if not isinstance(site, dict):
+    site = {}
+site.setdefault("root", "")
+site.setdefault("deployOnInstall", True)
+site.setdefault("deployOnUpdate", "missing-only")
+site.setdefault("createIfMissing", True)
+site["enabled"] = True
+site["sourceType"] = "archive_url"
+site["sourceUrl"] = source_url
+data["staticSite"] = site
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+PY
 }
 
 current_release() {
@@ -109,13 +149,15 @@ PY
 }
 
 cmd_status() {
-  local root release source enabled state
+  local root release source enabled state domain_name
   root="$(site_root)"
   release="$(current_release)"
   source="$(cfg staticSite.sourceUrl)"
   enabled="$(cfg staticSite.enabled)"
   state="$(state_file)"
+  domain_name="$(domain)"
   echo "enabled: ${enabled:-false}"
+  echo "domain: ${domain_name:-}"
   echo "root: $root"
   echo "sourceUrl: ${source:-}"
   echo "installed: $([[ -f "$root/index.html" ]] && echo yes || echo no)"
@@ -140,13 +182,79 @@ normalize_release() {
   [[ -f "$release_dir/index.html" ]] || die "Archive does not contain index.html"
 }
 
+resolve_deploy_url() {
+  local provided_url="$1"
+  local current_url
+  current_url="$(cfg staticSite.sourceUrl)"
+  if [[ -n "$provided_url" ]]; then
+    echo "$provided_url"
+    return 0
+  fi
+  if [[ -n "$current_url" ]]; then
+    if [[ -t 0 ]]; then
+      echo "Current static site URL:" >&2
+      echo "$current_url" >&2
+      local answer
+      read -rp "Use this URL? [Y/n]: " answer
+      if [[ ! "${answer:-Y}" =~ ^([Nn]|Н|н)$ ]]; then
+        echo "$current_url"
+        return 0
+      fi
+    else
+      echo "$current_url"
+      return 0
+    fi
+  fi
+  if [[ -t 0 ]]; then
+    local input_url
+    read -rp "dist.tar.gz archive URL: " input_url
+    [[ -n "$input_url" ]] || die "Static site archive URL is empty"
+    echo "$input_url"
+    return 0
+  fi
+  die "Static site archive URL is empty; pass --url URL or set staticSite.sourceUrl"
+}
+
+reload_caddy_if_active() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  if systemctl is-active --quiet caddy-naive 2>/dev/null; then
+    systemctl reload caddy-naive 2>/dev/null || systemctl restart caddy-naive 2>/dev/null || \
+      log_warn "caddy-naive reload/restart failed"
+  fi
+}
+
 cmd_deploy() {
-  site_enabled || die "staticSite.enabled is false"
+  local provided_url=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --url)
+        shift
+        provided_url="${1:-}"
+        [[ -n "$provided_url" ]] || die "--url requires an argument"
+        ;;
+      --url=*)
+        provided_url="${1#--url=}"
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      *)
+        if [[ -z "$provided_url" ]]; then
+          provided_url="$1"
+        else
+          die "Unexpected argument: $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+
   local source_type source_url root base releases release_dir tmp archive
+  source_url="$(resolve_deploy_url "$provided_url")"
   source_type="$(cfg staticSite.sourceType)"
-  source_url="$(cfg staticSite.sourceUrl)"
+  [[ -z "$source_type" ]] && source_type="archive_url"
   [[ "$source_type" == "archive_url" ]] || die "Unsupported sourceType: ${source_type:-}"
-  [[ -n "$source_url" ]] || die "staticSite.sourceUrl is empty"
 
   root="$(site_root)"
   base="$(site_base)"
@@ -164,14 +272,22 @@ cmd_deploy() {
   normalize_release "$release_dir"
 
   point_root_to_release "$release_dir"
+  set_static_site_source "$source_url"
+  write_state "$release_dir"
   if ! id caddy >/dev/null 2>&1 && [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
     useradd --system --no-create-home --shell /usr/sbin/nologin caddy
   fi
   id caddy >/dev/null 2>&1 && chown -R caddy:caddy "$base"
   find "$base" -type d -exec chmod 755 {} +
   find "$base" -type f -exec chmod 644 {} +
-  write_state "$release_dir"
+  reload_caddy_if_active
   log_info "Static site deployed to $root"
+  echo ""
+  echo "domain: $(domain)"
+  echo "root: $root"
+  echo "sourceUrl: $source_url"
+  echo "releaseDir: $release_dir"
+  echo "currentSymlinkTarget: $(current_release)"
 }
 
 cmd_rollback() {
@@ -187,9 +303,12 @@ cmd_rollback() {
   log_info "Rolled back static site to $previous"
 }
 
-case "${1:-status}" in
-  status) cmd_status ;;
-  deploy) cmd_deploy ;;
-  rollback) cmd_rollback ;;
-  *) die "Usage: $0 {status|deploy|rollback}" ;;
+cmd="${1:-status}"
+shift || true
+case "$cmd" in
+  status) cmd_status "$@" ;;
+  deploy) cmd_deploy "$@" ;;
+  rollback) cmd_rollback "$@" ;;
+  -h|--help|help) usage ;;
+  *) usage; die "Unknown command: $cmd" ;;
 esac

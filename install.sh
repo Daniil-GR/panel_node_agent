@@ -1463,6 +1463,17 @@ assert m[0].get('transport','TCP') in ('TCP','UDP'), 'invalid transport'
 }
 
 # ── Smoke tests ───────────────────────────────────────────────────────────────
+has_mieru_users() {
+  python3 - "$MITA_STATE_FILE" <<'PY' 2>/dev/null
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    data = {}
+raise SystemExit(0 if len(data.get("users", [])) > 0 else 1)
+PY
+}
+
 smoke_test() {
   log_step "$(t 'Smoke-тесты' 'Running smoke tests')"
   sleep 5
@@ -1491,9 +1502,12 @@ smoke_test() {
   # mita tests
   chk "mita.service enabled"         "systemctl is-enabled mita"
   chk "mita-state.json present"      "[[ -f $MITA_STATE_FILE ]]"
-  chk "mita port :${MIERU_PORT_START} OR service starting" \
-      "ss -tlnup sport = :${MIERU_PORT_START} 2>/dev/null | grep -q :${MIERU_PORT_START} || \
-       systemctl is-enabled mita"
+  if has_mieru_users; then
+    chk "mita active with configured users" "systemctl is-active --quiet mita"
+  else
+    echo -e "  ${GREEN}✓${NC} mita idle OK, no Mieru users configured"
+    (( pass++ ))
+  fi
 
   # Panel
   chk "Panel responds :3000"         "curl -sf http://127.0.0.1:3000/ -o /dev/null"

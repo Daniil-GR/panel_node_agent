@@ -137,6 +137,36 @@ bash /opt/panel-naive-mieru/scripts/static-site.sh deploy
 bash /opt/panel-naive-mieru/scripts/static-site.sh rollback
 ```
 
+### Update Only Static Site
+
+To update only the placeholder site without updating the panel, Naive/Caddy,
+Mieru, users, Caddyfile, or `/sub/*`, run:
+
+```bash
+sudo bash /opt/panel-naive-mieru/scripts/static-site.sh deploy
+```
+
+If `staticSite.sourceUrl` is already saved in `/etc/rixxx-panel/config.json`,
+the command offers to reuse it. To provide a new archive URL non-interactively:
+
+```bash
+sudo bash /opt/panel-naive-mieru/scripts/static-site.sh deploy \
+  --url "https://example.com/dist.tar.gz"
+```
+
+or:
+
+```bash
+sudo bash /opt/panel-naive-mieru/scripts/static-site.sh deploy \
+  "https://example.com/dist.tar.gz"
+```
+
+The deploy command downloads a ready `dist.tar.gz`, validates that it contains
+`index.html`, creates a new `/var/www/{domain}/releases/{timestamp}` release,
+switches `/var/www/{domain}/dist` with `ln -sfnT`, updates
+`.vetka-static-site.json`, stores the new `sourceUrl` in config, and reloads
+`caddy-naive` only if that service is active.
+
 
 > ⚠️ **Важно:** `/etc/mita/` — внутреннее хранилище Mieru в формате protobuf, **не редактируется вручную**.  
 > Панель использует `/var/lib/rixxx-panel/mita-state.json` и применяет его командой `mita apply config <file>`.
