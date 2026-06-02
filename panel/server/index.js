@@ -76,6 +76,15 @@ try {
     caddyFile:     CADDY_FILE,
     caddyConfigDir: CADDY_CONFIG_DIR,
     fakeSiteDir:   FAKE_SITE_DIR,
+    staticSite: {
+      enabled: false,
+      root: '',
+      sourceType: 'archive_url',
+      sourceUrl: '',
+      deployOnInstall: true,
+      deployOnUpdate: 'missing-only',
+      createIfMissing: true
+    },
     fakeSiteUrl:   'https://www.example.com',
     probeSecret:   '',
     probeMode:     'bare',   // Bug 81: 'off' | 'bare' | 'secret' (matches known-good ref)
@@ -103,6 +112,17 @@ try {
 cfg.sessionTtlMinutes = parseInt(cfg.sessionTtlMinutes, 10) || 10;
 if (cfg.authAuditLogPath === undefined) cfg.authAuditLogPath = LOG_AUTH_AUDIT;
 if (cfg.trafficAuditLogPath === undefined) cfg.trafficAuditLogPath = LOG_TRAFFIC_AUDIT;
+if (!cfg.staticSite || typeof cfg.staticSite !== 'object') {
+  cfg.staticSite = {
+    enabled: false,
+    root: '',
+    sourceType: 'archive_url',
+    sourceUrl: '',
+    deployOnInstall: true,
+    deployOnUpdate: 'missing-only',
+    createIfMissing: true
+  };
+}
 cfg.ipHistoryTtlHours = parseInt(cfg.ipHistoryTtlHours, 10) || 24;
 cfg.maxUniqueIpsPerUser = parseInt(cfg.maxUniqueIpsPerUser, 10) || 5;
 if (cfg.backendAllowedIps === undefined) cfg.backendAllowedIps = ['127.0.0.1'];
@@ -116,6 +136,12 @@ const resolvedCaddyFile = cfg.caddyFile     || CADDY_FILE;
 const resolvedCaddyBin  = cfg.caddyBin      || CADDY_BIN;
 const resolvedCaddyCfgDir = cfg.caddyConfigDir || CADDY_CONFIG_DIR;
 const resolvedFakeSiteDir = cfg.fakeSiteDir  || FAKE_SITE_DIR;
+
+function staticSiteRoot(config = cfg) {
+  const domain = String(config.domain || 'localhost').trim();
+  const site = config.staticSite || {};
+  return String(site.root || '').trim() || `/var/www/${domain}/dist`;
+}
 
 // ── SQLite (better-sqlite3) ───────────────────────────────────────────────────
 let db = null;
@@ -388,6 +414,7 @@ function buildCaddyfile(config, users) {
       naivePort:   config.naivePort   || 443,
       panelPort:   config.panelPort   || 3000,
       fakeSiteDir: resolvedFakeSiteDir,
+      staticSite:  config.staticSite,
       probeSecret,
       probeMode,
       logFile:     LOG_CADDY,
@@ -431,6 +458,9 @@ function buildCaddyfile(config, users) {
   const authAuditLogLine = authAuditLogPath ? `\n    auth_audit_log ${authAuditLogPath}` : '';
   const trafficAuditLogPath = (config.trafficAuditLogPath || '').trim();
   const trafficAuditLogLine = trafficAuditLogPath ? `\n    traffic_audit_log ${trafficAuditLogPath}` : '';
+  const siteRoot = (config.staticSite && config.staticSite.enabled === true)
+    ? staticSiteRoot(config)
+    : resolvedFakeSiteDir;
 
   // Bug 28: no "tls <email>" inside site block
   // Bug 30: order directive in global block
@@ -477,7 +507,7 @@ ${authLines}
   }
 
   file_server {
-    root ${resolvedFakeSiteDir}
+    root ${siteRoot}
   }
 }
 `;

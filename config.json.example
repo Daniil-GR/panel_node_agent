@@ -17,6 +17,15 @@
   "caddyConfigDir": "/etc/caddy-naive",
   "fakeSiteDir": "/var/www/fake-site",
   "fakeSiteUrl": "https://www.example.com",
+  "staticSite": {
+    "enabled": false,
+    "root": "",
+    "sourceType": "archive_url",
+    "sourceUrl": "",
+    "deployOnInstall": true,
+    "deployOnUpdate": "missing-only",
+    "createIfMissing": true
+  },
   "probeSecret": "",
   "probeMode": "bare",
   "nodeApiKey": "replace-with-long-random-secret",

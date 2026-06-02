@@ -74,6 +74,8 @@ FORCE=false
 YES=false
 MODE=""
 EXPOSE_DOMAIN=""
+UPDATE_STATIC_SITE=false
+SKIP_STATIC_SITE=false
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 parse_args() {
@@ -86,6 +88,8 @@ parse_args() {
       --ssh-only)  MODE="ssh-only" ;;
       --status)    MODE="status" ;;
       --repair)    MODE="repair" ;;
+      --update-static-site) UPDATE_STATIC_SITE=true ;;
+      --skip-static-site) SKIP_STATIC_SITE=true ;;
       --help|-h)   print_help; exit 0 ;;
       *) die "Unknown argument: $1  (use --help)" ;;
     esac
@@ -119,6 +123,8 @@ OPTIONS:
   --ssh-only             Switch panel back to SSH-tunnel-only (127.0.0.1:3000)
   --status               Print full health report
   --repair               Rebuild Caddyfile + mita config from SQLite DB; restart services
+  --update-static-site   Force deploy the managed static placeholder site
+  --skip-static-site     Skip all managed static site actions
   --help                 Show this help
 
 EXAMPLES:
@@ -163,7 +169,7 @@ load_config() {
   CADDY_BIN=$(jq -r '.caddyBin     // "/usr/local/bin/caddy-naive"' "$PANEL_CONFIG")
   CADDY_FILE=$(jq -r '.caddyFile   // "/etc/caddy-naive/Caddyfile"' "$PANEL_CONFIG")
   CADDY_CONFIG_DIR=$(jq -r '.caddyConfigDir // "/etc/caddy-naive"'  "$PANEL_CONFIG")
-  FAKE_SITE_DIR=$(jq -r '.fakeSiteDir   // "/var/www/fake-site"'    "$PANEL_CONFIG")
+  FAKE_SITE_DIR=$(jq -r 'if (.staticSite.enabled // false) then ((.staticSite.root // "") as $r | if $r != "" then $r else "/var/www/" + .domain + "/dist" end) else (.fakeSiteDir // "/var/www/fake-site") end' "$PANEL_CONFIG")
 }
 
 # ── Bug 81: config migration ──────────────────────────────────────────────────
@@ -212,6 +218,22 @@ migrate_config() {
     fi
     rm -f "$tmp"
   fi
+  local tmp; tmp=$(mktemp)
+  if jq '.staticSite = ({
+      enabled: false,
+      root: "",
+      sourceType: "archive_url",
+      sourceUrl: "",
+      deployOnInstall: true,
+      deployOnUpdate: "missing-only",
+      createIfMissing: true
+    } + (.staticSite // {}))' "$PANEL_CONFIG" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+    if ! cmp -s "$PANEL_CONFIG" "$tmp"; then
+      cat "$tmp" > "$PANEL_CONFIG"
+      log_info "Config migrated: staticSite defaults added ✓"
+    fi
+  fi
+  rm -f "$tmp"
 }
 
 # ── Backup ────────────────────────────────────────────────────────────────────
@@ -373,7 +395,9 @@ if (fs.existsSync(TEMPLATE_JS)) {
     adminEmail:  cfg.adminEmail  || '',
     domain:      cfg.domain      || 'localhost',
     naivePort:   cfg.naivePort   || 443,
+    panelPort:   cfg.panelPort   || 3000,
     fakeSiteDir: cfg.fakeSiteDir || FAKE_SITE,
+    staticSite:  cfg.staticSite,
     probeSecret,
     probeMode,
     logFile:     '/var/log/caddy-naive/access.log',
@@ -399,6 +423,10 @@ if (fs.existsSync(TEMPLATE_JS)) {
   const authAuditLogLine = authAuditLogPath ? '\n    auth_audit_log ' + authAuditLogPath : '';
   const trafficAuditLogPath = (cfg.trafficAuditLogPath || '').trim();
   const trafficAuditLogLine = trafficAuditLogPath ? '\n    traffic_audit_log ' + trafficAuditLogPath : '';
+  const staticSite = cfg.staticSite || {};
+  const siteRoot = staticSite.enabled === true
+    ? ((staticSite.root || '').trim() || ('/var/www/' + (cfg.domain || 'localhost') + '/dist'))
+    : (cfg.fakeSiteDir || FAKE_SITE);
   content = [
     '{',
     '  order forward_proxy before file_server',
@@ -424,6 +452,10 @@ if (fs.existsSync(TEMPLATE_JS)) {
     ':' + (cfg.naivePort || 443) + ', ' + (cfg.domain || 'localhost') + ' {',
     '  tls ' + (cfg.adminEmail || ''),
     '',
+    '  handle /sub/* {',
+    '    reverse_proxy 127.0.0.1:' + (cfg.panelPort || 3000),
+    '  }',
+    '',
     '  forward_proxy {',
     authLines,
     '    hide_ip',
@@ -431,7 +463,7 @@ if (fs.existsSync(TEMPLATE_JS)) {
     '  }',
     '',
     '  file_server {',
-    '    root ' + (cfg.fakeSiteDir || FAKE_SITE),
+    '    root ' + siteRoot,
     '  }',
     '}'
   ].join('\n');
@@ -894,6 +926,38 @@ update_panel() {
   rm -rf "$tmp"
 }
 
+update_static_site() {
+  $DRY_RUN && { log_dry "Would check/deploy managed static site"; return; }
+  if $SKIP_STATIC_SITE; then
+    log_info "Static site actions skipped (--skip-static-site)"
+    return 0
+  fi
+  if [[ ! -f "$PANEL_CONFIG" ]] || ! command -v jq &>/dev/null; then
+    return 0
+  fi
+  local enabled root source_url deploy_mode helper
+  enabled=$(jq -r '.staticSite.enabled // false' "$PANEL_CONFIG" 2>/dev/null)
+  [[ "$enabled" == "true" ]] || return 0
+  root=$(jq -r '(.staticSite.root // "") as $r | if $r != "" then $r else "/var/www/" + .domain + "/dist" end' "$PANEL_CONFIG")
+  source_url=$(jq -r '.staticSite.sourceUrl // ""' "$PANEL_CONFIG")
+  deploy_mode=$(jq -r '.staticSite.deployOnUpdate // "missing-only"' "$PANEL_CONFIG")
+  helper="${PANEL_DIR}/scripts/static-site.sh"
+
+  if ! $UPDATE_STATIC_SITE && [[ "$deploy_mode" == "missing-only" && -f "$root/index.html" ]]; then
+    log_info "Static site exists at $root; skipping deploy"
+    return 0
+  fi
+  if [[ -z "$source_url" ]]; then
+    log_warn "Static site missing or update requested, but staticSite.sourceUrl is empty"
+    return 0
+  fi
+  if [[ ! -f "$helper" ]]; then
+    log_warn "static-site helper not found at $helper; skipping static site deploy"
+    return 0
+  fi
+  bash "$helper" deploy
+}
+
 # ── Smoke tests ───────────────────────────────────────────────────────────────
 smoke_test() {
   log_step "Running smoke tests"
@@ -928,11 +992,16 @@ smoke_test() {
     echo -e "  ${RED}✗${NC} Caddyfile MISSING"; (( fail++ ))
   fi
 
-  # Fake site present
+  # Static/fake site present
+  local site_label="legacy fake-site/index.html"
+  if [[ -f "$PANEL_CONFIG" ]] && command -v jq &>/dev/null && \
+     [[ "$(jq -r '.staticSite.enabled // false' "$PANEL_CONFIG" 2>/dev/null)" == "true" ]]; then
+    site_label="static-site/index.html"
+  fi
   if [[ -f "${FAKE_SITE_DIR}/index.html" ]]; then
-    echo -e "  ${GREEN}✓${NC} fake-site/index.html present"; (( pass++ ))
+    echo -e "  ${GREEN}✓${NC} ${site_label} present"; (( pass++ ))
   else
-    echo -e "  ${YELLOW}⚠${NC}  fake-site/index.html missing (non-critical)"; 
+    echo -e "  ${YELLOW}⚠${NC}  ${site_label} missing (non-critical)";
   fi
 
   # Panel HTTP
@@ -1107,19 +1176,37 @@ do_repair() {
   # Bug 81: migrate config (set probeMode='bare' for pre-Bug 81 installs) so the
   # rebuilt Caddyfile matches the reference server's bare probe_resistance.
   migrate_config
+  load_config
 
-  # Step 1: ensure fake site exists
+  # Step 1: ensure static/fake site exists
   if [[ ! -f "${FAKE_SITE_DIR}/index.html" ]]; then
-    log_info "Recreating fake site..."
-    mkdir -p "$FAKE_SITE_DIR"
-    cat > "${FAKE_SITE_DIR}/index.html" <<'FAKEHTML'
+    local static_site_enabled="false"
+    if command -v jq &>/dev/null; then
+      static_site_enabled=$(jq -r '.staticSite.enabled // false' "$PANEL_CONFIG" 2>/dev/null)
+    fi
+    if [[ "$static_site_enabled" == "true" ]]; then
+      local static_source_url="" static_helper="${PANEL_DIR}/scripts/static-site.sh"
+      if command -v jq &>/dev/null; then
+        static_source_url=$(jq -r '.staticSite.sourceUrl // ""' "$PANEL_CONFIG" 2>/dev/null)
+      fi
+      if [[ -n "$static_source_url" && -f "$static_helper" ]]; then
+        log_info "Managed static site missing; deploying from configured archive..."
+        update_static_site || log_warn "Managed static site deploy failed during repair"
+      else
+        log_warn "Managed static site is enabled but index.html is missing; not creating legacy fake site in static root"
+      fi
+    else
+      log_info "Recreating fake site..."
+      mkdir -p "$FAKE_SITE_DIR"
+      cat > "${FAKE_SITE_DIR}/index.html" <<'FAKEHTML'
 <!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><title>Welcome</title></head>
 <body><h1>Welcome</h1><p>This service is currently unavailable.</p></body>
 </html>
 FAKEHTML
-    chmod 644 "${FAKE_SITE_DIR}/index.html"
-    log_info "Fake site recreated ✓"
+      chmod 644 "${FAKE_SITE_DIR}/index.html"
+      log_info "Fake site recreated ✓"
+    fi
   fi
 
   # Step 2: ensure caddy-naive.service exists
@@ -1199,11 +1286,13 @@ do_update() {
 
   # Bug 81: migrate config (set probeMode='bare' for pre-Bug 81 installs).
   migrate_config
+  load_config
 
   # Update components
   update_caddy_naive     # replaces update_naiveproxy() from v1.2.x
   update_mieru
   update_panel
+  update_static_site
 
   # Ensure service is present and legacy naive is gone
   ensure_caddy_service

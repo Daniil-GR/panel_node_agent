@@ -97,6 +97,47 @@ sudo bash update.sh --expose vpn.example.com
 | `/opt/panel-naive-mieru/` | Файлы приложения панели |
 | `/usr/local/bin/caddy-naive` | Бинарный файл caddy-forwardproxy-naive |
 
+### Managed Static Site Per Node
+
+Each Vetka node can serve its own static placeholder site. The site is not stored
+inside `panel_node_agent`; the agent downloads a ready `dist.tar.gz` archive and
+serves it through Caddy.
+
+Recommended format: a prebuilt `dist.tar.gz` from a GitHub Release or another
+trusted archive URL. The installer unpacks the archive, checks that `index.html`
+exists, and never runs scripts, `npm install`, or source builds on the server.
+The feature is disabled by default for existing nodes; `install.sh` enables it
+only when the setup wizard or `--static-site-url` provides an archive URL.
+
+Default path:
+
+```text
+/var/www/{domain}/dist
+```
+
+Example for `alps.vetka.tech`:
+
+```text
+/var/www/alps.vetka.tech/dist
+```
+
+Normal panel updates do not re-download the site. To force a static site update:
+
+```bash
+bash update.sh --update-static-site
+# or
+bash /opt/panel-naive-mieru/scripts/static-site.sh deploy
+```
+
+Useful helper commands:
+
+```bash
+bash /opt/panel-naive-mieru/scripts/static-site.sh status
+bash /opt/panel-naive-mieru/scripts/static-site.sh deploy
+bash /opt/panel-naive-mieru/scripts/static-site.sh rollback
+```
+
+
 > ⚠️ **Важно:** `/etc/mita/` — внутреннее хранилище Mieru в формате protobuf, **не редактируется вручную**.  
 > Панель использует `/var/lib/rixxx-panel/mita-state.json` и применяет его командой `mita apply config <file>`.
 

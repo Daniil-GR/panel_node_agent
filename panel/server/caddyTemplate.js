@@ -44,7 +44,9 @@ const crypto = require('crypto');
  *   .domain       {string}  VPN domain
  *   .naivePort    {number}  HTTPS port (default 443)
  *   .panelPort    {number}  local Express panel port for /sub/* proxy (default 3000)
- *   .fakeSiteDir  {string}  path to fake-site root
+ *   .fakeSiteDir  {string}  legacy path to fake-site root
+ *   .staticSite   {object}  managed static site config; when enabled, root is
+ *                           .staticSite.root or /var/www/<domain>/dist
  *   .probeSecret  {string}  probe_resistance token (used only when probeMode='secret')
  *   .probeMode    {string}  'off' | 'bare' | 'secret' (optional; derived from
  *                           probeSecret when unset — non-empty→'secret', empty→'bare')
@@ -62,7 +64,10 @@ function render(cfg, naiveUsers) {
   const domain     = (cfg.domain      || 'localhost').trim();
   const port       = cfg.naivePort   || 443;
   const panelPort  = cfg.panelPort   || 3000;
-  const fakeSite   = (cfg.fakeSiteDir || '/var/www/fake-site').trim();
+  const staticSite = cfg.staticSite || {};
+  const staticSiteEnabled = staticSite.enabled === true;
+  const staticRoot = (staticSite.root || '').trim() || `/var/www/${domain}/dist`;
+  const fakeSite   = (staticSiteEnabled ? staticRoot : (cfg.fakeSiteDir || '/var/www/fake-site')).trim();
   const probeSecret = (cfg.probeSecret || '').trim();
   const logFile    = (cfg.logFile     || '/var/log/caddy-naive/access.log').trim();
   const authAuditLogPath = (cfg.authAuditLogPath || '').trim();

@@ -138,7 +138,12 @@ detect_admin_pass
 log_step "Step 2: Caddyfile validation"
 assert "Caddyfile exists"                    "[[ -f '$CADDY_FILE' ]]"
 assert "probe_secret file exists"            "[[ -f '${CADDY_CONFIG_DIR}/probe_secret' ]]"
-assert "fake-site index.html exists"         "[[ -f '${FAKE_SITE_DIR}/index.html' ]]"
+SITE_INDEX_LABEL="fake-site index.html exists"
+if [[ -f "$PANEL_CONFIG" ]] && command -v jq &>/dev/null && \
+   [[ "$(jq -r '.staticSite.enabled // false' "$PANEL_CONFIG" 2>/dev/null)" == "true" ]]; then
+  SITE_INDEX_LABEL="static-site index.html exists"
+fi
+assert "$SITE_INDEX_LABEL"                   "[[ -f '${FAKE_SITE_DIR}/index.html' ]]"
 
 if [[ -x "$CADDY_BIN" ]]; then
   if "$CADDY_BIN" validate --config "$CADDY_FILE" --adapter caddyfile &>/dev/null; then

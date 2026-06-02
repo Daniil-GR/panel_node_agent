@@ -73,6 +73,13 @@ VETKA_CADDY_BUILD_DIR="${VETKA_CADDY_BUILD_DIR:-/opt/caddy-forwardproxy-vetka}"
 # ── Flags ─────────────────────────────────────────────────────────────────────
 NON_INTERACTIVE=false
 FORCE_INSTALL=false
+STATIC_SITE_ENABLED=false
+STATIC_SITE_SOURCE_TYPE="archive_url"
+STATIC_SITE_SOURCE_URL=""
+STATIC_SITE_ROOT=""
+STATIC_SITE_DEPLOY_ON_INSTALL=true
+STATIC_SITE_DEPLOY_ON_UPDATE="missing-only"
+STATIC_SITE_CREATE_IF_MISSING=true
 
 parse_install_args() {
   while [[ $# -gt 0 ]]; do
@@ -86,6 +93,9 @@ parse_install_args() {
       --mieru-start)    INPUT_MIERU_START="${2:-}";     shift ;;
       --mieru-end)      INPUT_MIERU_END="${2:-}";       shift ;;
       --fake-site-url)  INPUT_FAKE_SITE_URL="${2:-}";   shift ;;
+      --static-site-url) INPUT_STATIC_SITE_URL="${2:-}"; shift ;;
+      --static-site-root) INPUT_STATIC_SITE_ROOT="${2:-}"; shift ;;
+      --skip-static-site) INPUT_STATIC_SITE_SKIP=true ;;
       --probe-secret)   INPUT_PROBE_SECRET="${2:-}";    shift ;;
       --probe-mode)     INPUT_PROBE_MODE="${2:-}";      shift ;;
       --lang)
@@ -95,7 +105,8 @@ parse_install_args() {
         echo "Usage: bash install.sh [--non-interactive] [--domain DOMAIN] [--email EMAIL]"
         echo "                       [--admin-user USER] [--admin-pass PASS]"
         echo "                       [--naive-port PORT] [--mieru-start PORT] [--mieru-end PORT]"
-        echo "                       [--fake-site-url URL] [--probe-secret SECRET]"
+        echo "                       [--fake-site-url URL] [--static-site-url URL]"
+        echo "                       [--static-site-root PATH] [--skip-static-site] [--probe-secret SECRET]"
         echo "                       [--lang ru|en]"
         exit 0 ;;
       *) log_warn "Unknown argument: $1 (ignored)" ;;
@@ -489,6 +500,22 @@ gather_config() {
     fi
     # Bug 1 new fields: fake-site URL and probe secret
     FAKE_SITE_URL="${INPUT_FAKE_SITE_URL:-https://www.example.com}"
+    if [[ "${INPUT_STATIC_SITE_SKIP:-false}" == "true" || -z "${INPUT_STATIC_SITE_URL:-}" ]]; then
+      STATIC_SITE_ENABLED=false
+      if [[ "${INPUT_STATIC_SITE_SKIP:-false}" == "true" ]]; then
+        STATIC_SITE_SOURCE_TYPE="skip"
+      else
+        STATIC_SITE_SOURCE_TYPE="archive_url"
+        log_warn "Static site URL is empty; managed static site disabled"
+      fi
+      STATIC_SITE_SOURCE_URL="${INPUT_STATIC_SITE_URL:-}"
+      STATIC_SITE_ROOT="${INPUT_STATIC_SITE_ROOT:-}"
+    else
+      STATIC_SITE_ENABLED=true
+      STATIC_SITE_SOURCE_TYPE="archive_url"
+      STATIC_SITE_SOURCE_URL="${INPUT_STATIC_SITE_URL:-}"
+      STATIC_SITE_ROOT="${INPUT_STATIC_SITE_ROOT:-}"
+    fi
     PROBE_SECRET="${INPUT_PROBE_SECRET:-$(openssl rand -hex 16)}"
     # Bug 81: default probe_resistance mode = bare (matches known-good reference).
     PROBE_MODE="${INPUT_PROBE_MODE:-bare}"
@@ -545,6 +572,37 @@ gather_config() {
   read -rp "$(echo -e "${CYAN}$(t 'URL фейкового сайта' 'Fake site URL')${NC} [https://www.example.com]: ")" INPUT_FAKE_SITE_URL
   FAKE_SITE_URL="${INPUT_FAKE_SITE_URL:-https://www.example.com}"
 
+  echo ""
+  read -rp "$(echo -e "${CYAN}Configure static placeholder site?${NC} [Y/n]: ")" INPUT_STATIC_SITE_ENABLE
+  if [[ "${INPUT_STATIC_SITE_ENABLE:-Y}" =~ ^([Nn]|Н|н)$ ]]; then
+    STATIC_SITE_ENABLED=false
+    STATIC_SITE_SOURCE_TYPE="skip"
+    STATIC_SITE_SOURCE_URL=""
+    STATIC_SITE_ROOT=""
+  else
+    STATIC_SITE_ENABLED=true
+    STATIC_SITE_ROOT=""
+    echo "  1) archive_url"
+    echo "  2) skip"
+    read -rp "$(echo -e "${CYAN}Static site source type${NC} [1]: ")" INPUT_STATIC_SITE_TYPE
+    case "${INPUT_STATIC_SITE_TYPE:-1}" in
+      2|skip)
+        STATIC_SITE_ENABLED=false
+        STATIC_SITE_SOURCE_TYPE="skip"
+        STATIC_SITE_SOURCE_URL=""
+        ;;
+      *)
+        STATIC_SITE_SOURCE_TYPE="archive_url"
+        read -rp "$(echo -e "${CYAN}dist.tar.gz archive URL${NC}: ")" INPUT_STATIC_SITE_URL
+        STATIC_SITE_SOURCE_URL="${INPUT_STATIC_SITE_URL:-}"
+        if [[ -z "$STATIC_SITE_SOURCE_URL" ]]; then
+          STATIC_SITE_ENABLED=false
+          log_warn "Static site URL is empty; managed static site disabled"
+        fi
+        ;;
+    esac
+  fi
+
   # Probe secret
   echo ""
   echo -e "${YELLOW}$(t \
@@ -592,6 +650,15 @@ gather_config() {
 
 # ── Bug 1: Setup fake site ────────────────────────────────────────────────────
 setup_fake_site() {
+  if [[ "${STATIC_SITE_ENABLED:-false}" == "true" ]]; then
+    FAKE_SITE_DIR="${STATIC_SITE_ROOT:-/var/www/${DOMAIN}/dist}"
+    log_info "Managed static site enabled; Caddy root will be $FAKE_SITE_DIR"
+    if [[ "${STATIC_SITE_CREATE_IF_MISSING:-true}" == "true" ]]; then
+      mkdir -p "$FAKE_SITE_DIR"
+      chmod 755 "$(dirname "$FAKE_SITE_DIR")" "$FAKE_SITE_DIR" 2>/dev/null || true
+    fi
+    return 0
+  fi
   log_step "$(t 'Создание фейкового сайта (probe resistance)' 'Setting up fake site (probe resistance)')"
   mkdir -p "$FAKE_SITE_DIR"
   cat > "${FAKE_SITE_DIR}/index.html" <<FAKEHTML
@@ -697,7 +764,7 @@ write_caddyfile() {
 
   # Bug 46: log template errors to INSTALL_LOG instead of swallowing them
   if [[ -f "$template_js" ]] && command -v node &>/dev/null; then
-    caddyfile_content=$(node -e "
+    caddyfile_content=$(STATIC_SITE_ROOT="$STATIC_SITE_ROOT" node -e "
       const t = require('$template_js');
       const users = $naive_users_json;
       const cfg = {
@@ -706,6 +773,10 @@ write_caddyfile() {
         naivePort:   ${NAIVE_PORT},
         panelPort:   ${panel_listen_port},
         fakeSiteDir: '${FAKE_SITE_DIR}',
+        staticSite: {
+          enabled: ${STATIC_SITE_ENABLED},
+          root: process.env.STATIC_SITE_ROOT || ''
+        },
         probeSecret: '${PROBE_SECRET}',
         probeMode:   '${PROBE_MODE:-bare}',
         logFile:     '/var/log/caddy-naive/access.log',
@@ -1077,6 +1148,15 @@ data = {
     "caddyConfigDir":  "$CADDY_CONFIG_DIR",
     "fakeSiteDir":     "$FAKE_SITE_DIR",
     "fakeSiteUrl":     "$FAKE_SITE_URL",
+    "staticSite": {
+        "enabled": "$STATIC_SITE_ENABLED".lower() == "true",
+        "root": "$STATIC_SITE_ROOT",
+        "sourceType": "$STATIC_SITE_SOURCE_TYPE",
+        "sourceUrl": "$STATIC_SITE_SOURCE_URL",
+        "deployOnInstall": "$STATIC_SITE_DEPLOY_ON_INSTALL".lower() == "true",
+        "deployOnUpdate": "$STATIC_SITE_DEPLOY_ON_UPDATE",
+        "createIfMissing": "$STATIC_SITE_CREATE_IF_MISSING".lower() == "true"
+    },
     "probeSecret":     "$PROBE_SECRET",
     "probeMode":       "${PROBE_MODE:-bare}",
     "nodeApiKey":      "$node_api_key",
@@ -1126,6 +1206,26 @@ VEREOF
 # Bug 61:  Caddy failure is non-fatal — install continues so the user can reach
 #          the panel UI and diagnose/fix from there.
 # Bug 62:  ACME port-wait loop warns if :443 is not listening after 60 s.
+deploy_static_site() {
+  if [[ "${STATIC_SITE_ENABLED:-false}" != "true" ]]; then
+    return 0
+  fi
+  if [[ "${STATIC_SITE_DEPLOY_ON_INSTALL:-true}" != "true" ]]; then
+    log_info "Static site deployOnInstall=false; skipping deploy"
+    return 0
+  fi
+  if [[ "${STATIC_SITE_SOURCE_TYPE:-skip}" == "skip" || -z "${STATIC_SITE_SOURCE_URL:-}" ]]; then
+    log_warn "Static site enabled but no archive URL provided; expected root: ${FAKE_SITE_DIR}"
+    return 0
+  fi
+  local helper="${PANEL_DIR}/scripts/static-site.sh"
+  if [[ ! -f "$helper" ]]; then
+    log_warn "static-site helper not found at $helper; skipping deploy"
+    return 0
+  fi
+  bash "$helper" deploy || die "Static site deploy failed"
+}
+
 start_services() {
   log_step "$(t 'Запуск сервисов' 'Starting services')"
 
@@ -1382,7 +1482,11 @@ smoke_test() {
   chk "caddy-naive port :${NAIVE_PORT} listening" \
       "ss -tlnup sport = :${NAIVE_PORT} 2>/dev/null | grep -q :${NAIVE_PORT}"
   chk "Caddyfile present"            "[[ -f $CADDY_FILE ]]"
-  chk "fake-site index.html present" "[[ -f ${FAKE_SITE_DIR}/index.html ]]"
+  if [[ "${STATIC_SITE_ENABLED:-false}" == "true" ]]; then
+    chk "static-site index.html present" "[[ -f ${FAKE_SITE_DIR}/index.html ]]"
+  else
+    chk "legacy fake-site index.html present" "[[ -f ${FAKE_SITE_DIR}/index.html ]]"
+  fi
 
   # mita tests
   chk "mita.service enabled"         "systemctl is-enabled mita"
@@ -1506,12 +1610,13 @@ main() {
   gather_config
   setup_fake_site
   write_mita_state
-  write_caddyfile
-  write_caddy_service
   # Bug 41: install_panel BEFORE write_config_json so that bcryptjs (from
   # panel/node_modules) is available when we call  node -e "require('bcryptjs')"
   install_panel
   write_config_json
+  deploy_static_site
+  write_caddyfile
+  write_caddy_service
   write_version
   tune_network      # BBR + UDP buffers (uses panel/scripts/sysctl_tune.sh)
   maybe_ufw
