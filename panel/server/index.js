@@ -752,6 +752,7 @@ function buildMitaStateFile() {
   const tmp = resolvedMitaFile + '.new';
   fs.writeFileSync(tmp, JSON.stringify(mieruCfg, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, resolvedMitaFile);
+  ensureMitaStateReadableByDaemon(resolvedMitaFile);
 
   shredFile(resolvedMitaFile + '.last');
   try { fs.copyFileSync(resolvedMitaFile, resolvedMitaFile + '.last'); } catch {}
@@ -759,43 +760,124 @@ function buildMitaStateFile() {
   return resolvedMitaFile;
 }
 
-function applyMitaConfig() {
-  const file = buildMitaStateFile();
+function ensureMitaStateReadableByDaemon(file) {
   try {
-    execSync(`mita apply config ${file} 2>/dev/null`, { timeout: 15000 });
+    execFileSync('chgrp', ['mita', file], { timeout: 5000 });
+    execFileSync('chmod', ['640', file], { timeout: 5000 });
+    execFileSync('chmod', ['750', path.dirname(file)], { timeout: 5000 });
+  } catch (e) {
+    console.warn('[MITA] failed to adjust mita-state.json permissions:', commandText(e) || e.message);
+  }
+}
 
-    // Bug 75: a fresh mita install sits in state IDLE (the installer does NOT
-    // start it while users[] is empty — Bug 4). `mita reload` only re-reads the
-    // config of an already-RUNNING server; it will NOT lift IDLE -> RUNNING, so
-    // the proxy never starts listening and mieru clients can't connect.
-    // Therefore: detect status and `mita start` when IDLE, otherwise `reload`.
-    let status = '';
-    try { status = execSync('mita status 2>/dev/null', { timeout: 10000 }).toString(); }
-    catch { status = ''; }
+function commandText(error) {
+  if (!error) return '';
+  const stdout = error.stdout ? error.stdout.toString() : '';
+  const stderr = error.stderr ? error.stderr.toString() : '';
+  return `${stdout}${stderr}${error.message ? `\n${error.message}` : ''}`.trim();
+}
 
-    if (/RUNNING/i.test(status)) {
-      execSync('mita reload 2>/dev/null', { timeout: 15000 });
-    } else {
-      // IDLE (or unknown): start the service so it binds the configured ports.
-      // Fall back to systemctl restart if `mita start` is unavailable.
-      try { execSync('mita start 2>/dev/null', { timeout: 15000 }); }
-      catch { execSync('systemctl restart mita 2>/dev/null || true', { timeout: 15000 }); }
-    }
+function runLogged(command, args = [], options = {}) {
+  const label = [command, ...args].join(' ');
+  try {
+    const stdout = execFileSync(command, args, { encoding: 'utf8', timeout: options.timeout || 15000 });
+    if (stdout && stdout.trim()) console.log(`[MITA] ${label}\n${stdout.trim()}`);
+    return { ok: true, stdout: stdout || '', stderr: '', command: label };
+  } catch (e) {
+    const output = commandText(e);
+    console.error(`[MITA] ${label} failed${output ? `\n${output}` : ''}`);
+    return { ok: false, stdout: e.stdout ? e.stdout.toString() : '', stderr: e.stderr ? e.stderr.toString() : '', error: output || e.message, command: label };
+  }
+}
 
+function mitaUserCount(file) {
+  try {
+    const state = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return Array.isArray(state.users) ? state.users.length : 0;
+  } catch { return 0; }
+}
+
+function ensureMitaJsonBootstrap(file) {
+  const dir = '/etc/systemd/system/mita.service.d';
+  const dropIn = path.join(dir, '10-rixxx-panel.conf');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(dropIn, `[Service]\nEnvironment=MITA_CONFIG_JSON_FILE=${file}\n`, { mode: 0o644 });
+  runLogged('systemctl', ['daemon-reload'], { timeout: 10000 });
+  return dropIn;
+}
+
+function applyMitaConfigLive(file) {
+  return runLogged('mita', ['apply', 'config', file], { timeout: 15000 });
+}
+
+function startMitaDaemonForBootstrap(file) {
+  const dropIn = ensureMitaJsonBootstrap(file);
+  console.log(`[MITA] bootstrap drop-in ensured: ${dropIn}`);
+  runLogged('systemctl', ['reset-failed', 'mita'], { timeout: 10000 });
+  return runLogged('systemctl', ['restart', 'mita'], { timeout: 20000 });
+}
+
+function startMitaProxy() {
+  const status = runLogged('mita', ['status'], { timeout: 10000 });
+  if (status.ok && /RUNNING/i.test(status.stdout)) {
+    return runLogged('mita', ['reload'], { timeout: 15000 });
+  }
+  const stop = runLogged('mita', ['stop'], { timeout: 10000 });
+  if (!stop.ok) console.warn(`[MITA] mita stop before start returned non-zero: ${stop.error}`);
+  let start = runLogged('mita', ['start'], { timeout: 15000 });
+  if (!start.ok) {
+    const restart = runLogged('systemctl', ['restart', 'mita'], { timeout: 20000 });
+    if (!restart.ok) return restart;
+    start = runLogged('mita', ['start'], { timeout: 15000 });
+  }
+  return start;
+}
+
+function applyMitaConfigDetailed() {
+  const file = buildMitaStateFile();
+  const users = mitaUserCount(file);
+  if (users === 0) {
+    const error = 'Mieru не может быть запущен: нет активных Mieru-пользователей';
+    console.warn(`[MITA] ${error}`);
+    runLogged('systemctl', ['stop', 'mita'], { timeout: 10000 });
+    runLogged('systemctl', ['reset-failed', 'mita'], { timeout: 10000 });
     shredFile(file + '.last');
-    return true;
-  } catch { return false; }
+    return { ok: false, required: false, idle: true, users, file, error };
+  }
+
+  let apply = applyMitaConfigLive(file);
+  if (!apply.ok) {
+    const firstError = apply.error || '';
+    if (/daemon is not running|connection refused|connect: connection refused|no such file|unavailable/i.test(firstError)) {
+      const daemon = startMitaDaemonForBootstrap(file);
+      if (!daemon.ok) {
+        return { ok: false, required: true, users, file, error: `mita bootstrap daemon restart failed: ${daemon.error}`, applyError: firstError };
+      }
+      apply = applyMitaConfigLive(file);
+    }
+  }
+  if (!apply.ok) {
+    return { ok: false, required: true, users, file, error: apply.error || 'mita apply config failed' };
+  }
+
+  const started = startMitaProxy();
+  if (!started.ok) {
+    return { ok: false, required: true, users, file, error: started.error || 'mita start failed' };
+  }
+
+  shredFile(file + '.last');
+  return { ok: true, required: true, users, file, applyOutput: apply.stdout || '', startOutput: started.stdout || '' };
+}
+
+function applyMitaConfig() {
+  try {
+    return applyMitaConfigDetailed().ok;
+  } catch (e) { console.error('[MITA]', e.message); return false; }
 }
 
 function restartMieru() {
-  try {
-    execSync('mita stop 2>/dev/null || true', { timeout: 10000 });
-    const file = buildMitaStateFile();
-    execSync(`mita apply config ${file} 2>/dev/null`, { timeout: 10000 });
-    execSync('mita start 2>/dev/null || systemctl start mita 2>/dev/null', { timeout: 15000 });
-    shredFile(file + '.last');
-    return true;
-  } catch { return false; }
+  try { return applyMitaConfigDetailed().ok; }
+  catch (e) { console.error('[MITA]', e.message); return false; }
 }
 
 // ── Mieru cascade (Variant B) — scripts/cascade_mieru.sh orchestrator ─────────
@@ -833,7 +915,7 @@ function shredFile(fp) {
 // Rebuilds Caddyfile, reloads Caddy, rebuilds mita state, applies mita config.
 // Called after every user CRUD operation.
 function applyAllConfigs() {
-  let caddyOk = false, mitaOk = false, caddyError = '', caddyAction = '';
+  let caddyOk = false, mitaOk = false, caddyError = '', caddyAction = '', mitaError = '', mitaRequired = false, mitaIdle = false;
   try {
     const content = buildCaddyfile(cfg, getAllUsers());
     writeCaddyfileAtomic(content);
@@ -847,9 +929,14 @@ function applyAllConfigs() {
       caddyError = applied.error || '';
     }
   } catch (e) { caddyError = e.message; console.error('[CADDY]', e.message); }
-  try { mitaOk = applyMitaConfig(); }
-  catch (e) { console.error('[MITA]', e.message); }
-  return { caddyOk, mitaOk, caddyAction, caddyError, servicesReloaded: caddyOk && mitaOk };
+  try {
+    const mita = applyMitaConfigDetailed();
+    mitaOk = mita.ok;
+    mitaError = mita.error || '';
+    mitaRequired = !!mita.required;
+    mitaIdle = !!mita.idle;
+  } catch (e) { mitaError = e.message; console.error('[MITA]', e.message); }
+  return { caddyOk, mitaOk, mitaRequired, mitaIdle, mitaError, caddyAction, caddyError, servicesReloaded: caddyOk && (!mitaRequired || mitaOk) };
 }
 
 // ── Express app ───────────────────────────────────────────────────────────────
@@ -1812,6 +1899,11 @@ function assertCaddyApplied(status) {
     err.status = 500;
     throw err;
   }
+  if (status.mitaRequired && !status.mitaOk) {
+    const err = new Error(status.mitaError || 'mita failed to apply config');
+    err.status = 500;
+    throw err;
+  }
 }
 
 // ── Users API ─────────────────────────────────────────────────────────────────
@@ -2084,8 +2176,12 @@ app.post('/api/settings/mieru-ports', requireAuth, (req, res) => {
   } catch {}
 
   try {
-    const ok = restartMieru();
-    res.json({ ok, message: `Mieru ports changed to ${s}–${e}. Service restarted. Clients must download new configs.` });
+    const mita = applyMitaConfigDetailed();
+    if (mita.required && !mita.ok) return res.status(500).json({ ok: false, error: mita.error });
+    res.json({ ok: true, mitaOk: mita.ok, mitaRequired: mita.required, mitaIdle: mita.idle, mitaError: mita.error || '',
+      message: mita.idle
+        ? 'Mieru не может быть запущен: нет активных Mieru-пользователей'
+        : `Mieru ports changed to ${s}–${e}. Service restarted. Clients must download new configs.` });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -2102,8 +2198,9 @@ app.post('/api/settings/traffic-pattern', requireAuth, (req, res) => {
   }
   cfg.trafficPattern = pattern; saveConfig();
   try {
-    const ok = applyMitaConfig();
-    res.json({ ok, pattern, mtu: cfg.mtu });
+    const mita = applyMitaConfigDetailed();
+    if (mita.required && !mita.ok) return res.status(500).json({ ok: false, error: mita.error, pattern, mtu: cfg.mtu });
+    res.json({ ok: true, mitaOk: mita.ok, mitaRequired: mita.required, mitaIdle: mita.idle, mitaError: mita.error || '', pattern, mtu: cfg.mtu });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2121,9 +2218,12 @@ app.post('/api/settings/udp-toggle', requireAuth, (req, res) => {
     }
   } catch {}
   try {
-    const ok = restartMieru();
-    res.json({ ok, udpEnabled: enable,
-      message: `UDP ${enable ? 'enabled' : 'disabled'}. Mieru restarted.` });
+    const mita = applyMitaConfigDetailed();
+    if (mita.required && !mita.ok) return res.status(500).json({ ok: false, error: mita.error, udpEnabled: enable });
+    res.json({ ok: true, mitaOk: mita.ok, mitaRequired: mita.required, mitaIdle: mita.idle, mitaError: mita.error || '', udpEnabled: enable,
+      message: mita.idle
+        ? 'Mieru не может быть запущен: нет активных Mieru-пользователей'
+        : `UDP ${enable ? 'enabled' : 'disabled'}. Mieru restarted.` });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -2208,9 +2308,11 @@ app.post('/api/services/rebuild-all', requireAuth, (req, res) => {
     if (!validation.ok) return res.status(500).json({ ok: false, error: validation.error });
     const caddy = reloadCaddy();
     if (!caddy.ok) return res.status(500).json({ ok: false, error: caddy.error });
-    const mitaOk  = applyMitaConfig();
-    res.json({ ok: true, caddyOk: true, caddyAction: caddy.action, mitaOk,
-      message: 'Caddyfile and mita-state.json rebuilt from database.' });
+    const mita = applyMitaConfigDetailed();
+    if (mita.required && !mita.ok) return res.status(500).json({ ok: false, caddyOk: true, caddyAction: caddy.action, mitaOk: false, error: mita.error });
+    res.json({ ok: true, caddyOk: true, caddyAction: caddy.action, mitaOk: mita.ok,
+      mitaRequired: mita.required, mitaIdle: mita.idle, mitaError: mita.error || '',
+      message: 'Caddyfile and Mieru config rebuilt/applied from database.' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2290,11 +2392,12 @@ app.post('/api/settings/cascade', requireAuth, (req, res) => {
     }
 
     // Entry mita stays a plain server in Variant B — just re-apply its config.
-    const mitaOk = applyMitaConfig();
+    const mita = applyMitaConfigDetailed();
+    if (mita.required && !mita.ok) return res.status(500).json({ ok: false, caddyOk: true, caddyAction: caddy.action, mitaOk: false, cascadeOk, cascadeOutput: cascadeOut, error: mita.error });
 
     res.json({
       ok: cascadeOk,
-      caddyOk: true, caddyAction: caddy.action, mitaOk, cascadeOk,
+      caddyOk: true, caddyAction: caddy.action, mitaOk: mita.ok, mitaRequired: mita.required, mitaIdle: mita.idle, mitaError: mita.error || '', cascadeOk,
       cascadeOutput: cascadeOut,
       message: enabled
         ? (hasMieruExit

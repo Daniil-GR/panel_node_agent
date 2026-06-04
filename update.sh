@@ -553,6 +553,9 @@ rebuild_mita_state_direct() {
     log_warn "Node mita state rebuild failed"
     return 1
   }
+  chgrp mita "$MITA_STATE_FILE" 2>/dev/null || true
+  chmod 640 "$MITA_STATE_FILE" 2>/dev/null || true
+  chmod 750 "$(dirname "$MITA_STATE_FILE")" 2>/dev/null || true
   log_info "mita-state.json rebuilt ✓"
 }
 
@@ -832,6 +835,43 @@ except Exception:
     data = {}
 raise SystemExit(0 if len(data.get("users", [])) > 0 else 1)
 PY
+}
+
+ensure_mita_json_bootstrap() {
+  mkdir -p /etc/systemd/system/mita.service.d
+  cat > /etc/systemd/system/mita.service.d/10-rixxx-panel.conf <<MITADROPIN
+[Service]
+Environment=MITA_CONFIG_JSON_FILE=${MITA_STATE_FILE}
+MITADROPIN
+  systemctl daemon-reload
+}
+
+apply_mita_config_bootstrap() {
+  if ! has_mieru_users; then
+    log_warn "Mieru не может быть запущен: нет активных Mieru-пользователей"
+    systemctl stop mita 2>/dev/null || true
+    systemctl reset-failed mita 2>/dev/null || true
+    return 2
+  fi
+
+  local out
+  if out=$(mita apply config "$MITA_STATE_FILE" 2>&1); then
+    [[ -n "$out" ]] && log_info "mita apply config output: $out"
+    return 0
+  fi
+  log_warn "mita apply config failed: $out"
+  if echo "$out" | grep -qiE 'daemon is not running|connection refused|unavailable'; then
+    ensure_mita_json_bootstrap
+    systemctl reset-failed mita 2>/dev/null || true
+    systemctl restart mita 2>&1 || true
+    sleep 1
+    if out=$(mita apply config "$MITA_STATE_FILE" 2>&1); then
+      [[ -n "$out" ]] && log_info "mita apply config output: $out"
+      return 0
+    fi
+  fi
+  log_warn "mita apply config failed after bootstrap: $out"
+  return 1
 }
 
 update_mieru() {
@@ -1245,9 +1285,13 @@ FAKEHTML
 
   # Step 4: apply mita config
   if [[ -f "$MITA_STATE_FILE" ]]; then
-    mita apply config "$MITA_STATE_FILE" 2>/dev/null && \
-      log_info "mita config applied ✓" || \
-      log_warn "mita apply returned non-zero — check: mita status"
+    local _mita_apply_rc=0
+    apply_mita_config_bootstrap || _mita_apply_rc=$?
+    if [[ "$_mita_apply_rc" -eq 0 ]]; then
+      log_info "mita config applied ✓"
+    elif [[ "$_mita_apply_rc" -ne 2 ]]; then
+      log_warn "mita apply returned non-zero — see command output above"
+    fi
   fi
 
   # Step 5: reload/restart services
@@ -1258,9 +1302,15 @@ FAKEHTML
     systemctl restart caddy-naive 2>/dev/null && \
     log_info "caddy-naive reloaded ✓" || \
     log_warn "caddy-naive reload failed — journalctl -u caddy-naive -n 20"
-  if python3 -c "import json; d=json.load(open('$MITA_STATE_FILE')); raise SystemExit(0 if len(d.get('users', [])) > 0 else 1)" 2>/dev/null; then
-    systemctl restart mita 2>/dev/null && log_info "mita restarted ✓" || \
+  if has_mieru_users; then
+    local _mita_restart_out
+    if _mita_restart_out=$(systemctl restart mita 2>&1); then
+      [[ -n "$_mita_restart_out" ]] && log_info "systemctl restart mita output: $_mita_restart_out"
+      log_info "mita restarted ✓"
+    else
+      log_warn "mita restart failed: $_mita_restart_out"
       log_warn "mita restart failed — journalctl -u mita -n 20"
+    fi
   else
     systemctl stop mita 2>/dev/null || true
     systemctl reset-failed mita 2>/dev/null || true

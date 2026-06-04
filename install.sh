@@ -980,7 +980,9 @@ cfg = {
 with open("$MITA_STATE_FILE", "w") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
-  chmod 600 "$MITA_STATE_FILE"
+  chgrp mita "$MITA_STATE_FILE" 2>/dev/null || true
+  chmod 640 "$MITA_STATE_FILE"
+  chmod 750 "$(dirname "$MITA_STATE_FILE")" 2>/dev/null || true
   log_info "$(t "Mita state file → $MITA_STATE_FILE ✓" "Mita state file → $MITA_STATE_FILE ✓")"
 }
 
@@ -1226,6 +1228,43 @@ deploy_static_site() {
   bash "$helper" deploy || die "Static site deploy failed"
 }
 
+ensure_mita_json_bootstrap() {
+  mkdir -p /etc/systemd/system/mita.service.d
+  cat > /etc/systemd/system/mita.service.d/10-rixxx-panel.conf <<MITADROPIN
+[Service]
+Environment=MITA_CONFIG_JSON_FILE=${MITA_STATE_FILE}
+MITADROPIN
+  systemctl daemon-reload
+}
+
+apply_mita_config_bootstrap() {
+  if ! has_mieru_users; then
+    log_warn "Mieru не может быть запущен: нет активных Mieru-пользователей"
+    systemctl stop mita 2>/dev/null || true
+    systemctl reset-failed mita 2>/dev/null || true
+    return 2
+  fi
+
+  local out
+  if out=$(mita apply config "$MITA_STATE_FILE" 2>&1); then
+    [[ -n "$out" ]] && log_info "mita apply config output: $out"
+    return 0
+  fi
+  log_warn "mita apply config failed: $out"
+  if echo "$out" | grep -qiE 'daemon is not running|connection refused|unavailable'; then
+    ensure_mita_json_bootstrap
+    systemctl reset-failed mita 2>/dev/null || true
+    systemctl restart mita 2>&1 || true
+    sleep 1
+    if out=$(mita apply config "$MITA_STATE_FILE" 2>&1); then
+      [[ -n "$out" ]] && log_info "mita apply config output: $out"
+      return 0
+    fi
+  fi
+  log_warn "mita apply config failed after bootstrap: $out"
+  return 1
+}
+
 start_services() {
   log_step "$(t 'Запуск сервисов' 'Starting services')"
 
@@ -1319,9 +1358,11 @@ start_services() {
   # Apply portBindings config, but only start mita after first user is added.
   write_mita_service
   systemctl enable mita 2>/dev/null || true
-  if mita apply config "$MITA_STATE_FILE" 2>/dev/null; then
+  local _mita_apply_rc=0
+  apply_mita_config_bootstrap || _mita_apply_rc=$?
+  if [[ "$_mita_apply_rc" -eq 0 ]]; then
     log_info "$(t 'mita config применён ✓' 'mita config applied ✓')"
-  else
+  elif [[ "$_mita_apply_rc" -ne 2 ]]; then
     log_warn "$(t 'mita apply config вернул ошибку — проверьте: mita status' \
                'mita apply config returned non-zero — check: mita status')"
   fi
@@ -1338,11 +1379,19 @@ except Exception:
     # Bug 75: the daemon (mita run) starting is NOT enough — the proxy stays in
     # state IDLE until `mita start` is issued. Restart the daemon, then start the
     # proxy so it actually binds the configured ports.
-    systemctl restart mita 2>/dev/null || true
+    local _mita_restart_out
+    if ! _mita_restart_out=$(systemctl restart mita 2>&1); then
+      log_warn "systemctl restart mita failed: $_mita_restart_out"
+    elif [[ -n "$_mita_restart_out" ]]; then
+      log_info "systemctl restart mita output: $_mita_restart_out"
+    fi
     sleep 1
-    if mita start 2>/dev/null; then
+    local _mita_start_out
+    if _mita_start_out=$(mita start 2>&1); then
+      [[ -n "$_mita_start_out" ]] && log_info "mita start output: $_mita_start_out"
       log_info "$(t 'mita запущен ✓' 'mita started ✓')"
     else
+      [[ -n "$_mita_start_out" ]] && log_warn "mita start failed: $_mita_start_out"
       log_warn "$(t 'mita не запустился — journalctl -u mita -n 30 / mita status' \
                    'mita failed to start — journalctl -u mita -n 30 / mita status')"
     fi

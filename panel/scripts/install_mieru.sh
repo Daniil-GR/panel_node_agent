@@ -42,6 +42,10 @@ rm -f "$deb_file"
 # Enable and start mita service
 systemctl daemon-reload
 systemctl enable mita 2>/dev/null || true
-systemctl restart mita 2>/dev/null || true
+if restart_out=$(systemctl restart mita 2>&1); then
+  [[ -n "$restart_out" ]] && echo "[mieru] systemctl restart output: $restart_out"
+else
+  echo "[WARN] systemctl restart mita failed: $restart_out"
+fi
 
 echo "[mieru] Installed: $(mita version 2>/dev/null | head -1 || echo $tag)"
