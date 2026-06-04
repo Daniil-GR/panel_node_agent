@@ -752,7 +752,7 @@ function buildMitaStateFile() {
   const tmp = resolvedMitaFile + '.new';
   fs.writeFileSync(tmp, JSON.stringify(mieruCfg, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, resolvedMitaFile);
-  ensureMitaStateReadableByDaemon(resolvedMitaFile);
+  ensureMitaStatePermissions(resolvedMitaFile);
 
   shredFile(resolvedMitaFile + '.last');
   try { fs.copyFileSync(resolvedMitaFile, resolvedMitaFile + '.last'); } catch {}
@@ -760,14 +760,42 @@ function buildMitaStateFile() {
   return resolvedMitaFile;
 }
 
-function ensureMitaStateReadableByDaemon(file) {
-  try {
-    execFileSync('chgrp', ['mita', file], { timeout: 5000 });
-    execFileSync('chmod', ['640', file], { timeout: 5000 });
-    execFileSync('chmod', ['750', path.dirname(file)], { timeout: 5000 });
-  } catch (e) {
-    console.warn('[MITA] failed to adjust mita-state.json permissions:', commandText(e) || e.message);
+function ensureMitaStatePermissions(file) {
+  const dir = path.dirname(file);
+  try { fs.mkdirSync(dir, { recursive: true }); }
+  catch (e) { return { ok: false, error: `Failed to create ${dir}: ${e.message}` }; }
+
+  const group = runLogged('getent', ['group', 'mita'], { timeout: 5000, quiet: true });
+  if (!group.ok) {
+    const error = 'mita group does not exist yet; cannot set mita-state.json group permissions';
+    console.warn(`[MITA] ${error}`);
+    return { ok: false, error };
   }
+
+  const steps = [
+    ['chgrp', ['mita', dir], `Failed to set mita group on ${dir}`],
+    ['chmod', ['750', dir], `Failed to set mode 750 on ${dir}`]
+  ];
+  if (fs.existsSync(file)) {
+    steps.push(
+      ['chgrp', ['mita', file], `Failed to set mita group on ${file}`],
+      ['chmod', ['640', file], `Failed to set mode 640 on ${file}`]
+    );
+  }
+
+  for (const [cmd, args, message] of steps) {
+    const r = runLogged(cmd, args, { timeout: 5000 });
+    if (!r.ok) return { ok: false, error: `${message}: ${r.error}` };
+  }
+
+  if (fs.existsSync(file)) {
+    const check = runLogged('bash', ['-lc', `if command -v sudo >/dev/null 2>&1; then sudo -u mita test -x ${shellQuote(dir)} && sudo -u mita test -r ${shellQuote(file)}; else runuser -u mita -- test -x ${shellQuote(dir)} && runuser -u mita -- test -r ${shellQuote(file)}; fi`], { timeout: 5000 });
+    if (!check.ok) {
+      return { ok: false, error: `mita cannot read ${file}. Check directory/file permissions. ${check.error}`.trim() };
+    }
+  }
+
+  return { ok: true };
 }
 
 function commandText(error) {
@@ -781,11 +809,11 @@ function runLogged(command, args = [], options = {}) {
   const label = [command, ...args].join(' ');
   try {
     const stdout = execFileSync(command, args, { encoding: 'utf8', timeout: options.timeout || 15000 });
-    if (stdout && stdout.trim()) console.log(`[MITA] ${label}\n${stdout.trim()}`);
+    if (!options.quiet && stdout && stdout.trim()) console.log(`[MITA] ${label}\n${stdout.trim()}`);
     return { ok: true, stdout: stdout || '', stderr: '', command: label };
   } catch (e) {
     const output = commandText(e);
-    console.error(`[MITA] ${label} failed${output ? `\n${output}` : ''}`);
+    if (!options.quiet) console.error(`[MITA] ${label} failed${output ? `\n${output}` : ''}`);
     return { ok: false, stdout: e.stdout ? e.stdout.toString() : '', stderr: e.stderr ? e.stderr.toString() : '', error: output || e.message, command: label };
   }
 }
@@ -836,6 +864,10 @@ function startMitaProxy() {
 function applyMitaConfigDetailed() {
   const file = buildMitaStateFile();
   const users = mitaUserCount(file);
+  const perms = ensureMitaStatePermissions(file);
+  if (!perms.ok) {
+    return { ok: false, required: users > 0, users, file, error: perms.error };
+  }
   if (users === 0) {
     const error = 'Mieru не может быть запущен: нет активных Mieru-пользователей';
     console.warn(`[MITA] ${error}`);

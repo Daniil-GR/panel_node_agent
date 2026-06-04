@@ -508,6 +508,51 @@ NODE_EOF
   log_info "Caddyfile rebuilt ✓"
 }
 
+ensure_mita_state_permissions() {
+  local dir
+  dir="$(dirname "$MITA_STATE_FILE")"
+  mkdir -p "$dir"
+
+  if ! getent group mita >/dev/null 2>&1; then
+    log_warn "mita group does not exist yet; cannot set mita-state.json group permissions"
+    return 1
+  fi
+
+  local out
+  if ! out=$(chgrp mita "$dir" 2>&1); then
+    log_warn "Failed to set mita group on $dir: $out"
+    return 1
+  fi
+  if ! out=$(chmod 750 "$dir" 2>&1); then
+    log_warn "Failed to set mode 750 on $dir: $out"
+    return 1
+  fi
+
+  if [[ -f "$MITA_STATE_FILE" ]]; then
+    if ! out=$(chgrp mita "$MITA_STATE_FILE" 2>&1); then
+      log_warn "Failed to set mita group on $MITA_STATE_FILE: $out"
+      return 1
+    fi
+    if ! out=$(chmod 640 "$MITA_STATE_FILE" 2>&1); then
+      log_warn "Failed to set mode 640 on $MITA_STATE_FILE: $out"
+      return 1
+    fi
+    if command -v sudo >/dev/null 2>&1; then
+      sudo -u mita test -x "$dir" && sudo -u mita test -r "$MITA_STATE_FILE" || {
+        log_warn "mita cannot read $MITA_STATE_FILE. Check directory/file permissions."
+        return 1
+      }
+    else
+      runuser -u mita -- test -x "$dir" && runuser -u mita -- test -r "$MITA_STATE_FILE" || {
+        log_warn "mita cannot read $MITA_STATE_FILE. Check directory/file permissions."
+        return 1
+      }
+    fi
+  fi
+
+  return 0
+}
+
 # ── v1.2.3: Rebuild mita-state.json from SQLite DB ───────────────────────────
 rebuild_mita_state_direct() {
   log_step "Rebuilding mita-state.json from database"
@@ -553,9 +598,7 @@ rebuild_mita_state_direct() {
     log_warn "Node mita state rebuild failed"
     return 1
   }
-  chgrp mita "$MITA_STATE_FILE" 2>/dev/null || true
-  chmod 640 "$MITA_STATE_FILE" 2>/dev/null || true
-  chmod 750 "$(dirname "$MITA_STATE_FILE")" 2>/dev/null || true
+  ensure_mita_state_permissions || true
   log_info "mita-state.json rebuilt ✓"
 }
 
@@ -853,6 +896,8 @@ apply_mita_config_bootstrap() {
     systemctl reset-failed mita 2>/dev/null || true
     return 2
   fi
+
+  ensure_mita_state_permissions || return 1
 
   local out
   if out=$(mita apply config "$MITA_STATE_FILE" 2>&1); then
@@ -1234,6 +1279,7 @@ do_repair() {
   # rebuilt Caddyfile matches the reference server's bare probe_resistance.
   migrate_config
   load_config
+  ensure_mita_state_permissions || true
 
   # Step 1: ensure static/fake site exists
   if [[ ! -f "${FAKE_SITE_DIR}/index.html" ]]; then
@@ -1358,6 +1404,7 @@ do_update() {
   # Update components
   update_caddy_naive     # replaces update_naiveproxy() from v1.2.x
   update_mieru
+  ensure_mita_state_permissions || true
   update_panel
   update_static_site
 
